@@ -27,8 +27,8 @@ importers:
   .:
     dependencies:
       '@agentclientprotocol/sdk':
-        specifier: ^1.3.0
-        version: 1.4.0(zod@4.6.7)
+        specifier: ^2.2.0
+        version: 2.2.0(zod@4.6.7)
       '@ai-sdk/anthropic':
         specifier: ^3.0.85
         version: 3.0.85(zod@4.6.7)
@@ -213,8 +213,8 @@ importers:
   plugins/vscode:
     dependencies:
       '@agentclientprotocol/sdk':
-        specifier: ^1.3.0
-        version: 1.4.0(zod@4.6.7)
+        specifier: ^2.2.0
+        version: 2.2.0(zod@4.6.7)
       ws:
         specifier: ^8.16.0
         version: 8.21.3
@@ -252,10 +252,14 @@ importers:
 
 packages:
 
-  '@agentclientprotocol/sdk@1.4.0':
-    resolution: {integrity: sha512-/eufudw+aFY1LKLolT6yFE6UMmYRl7fMJ/DEONSIyR6wI3slHWITBsANRGqXEY8FRzqUxwh7QEaGiZHcJPVThg==}
+  '@agentclientprotocol/sdk@2.2.0':
+    resolution: {integrity: sha512-o1+eDQVb05yzPY+5v54awHyONU1oeLsbLVavkwrMQaZDuJDh/38pQiXJS4ix4d6QA3Y4bU0lHFRjwg99KKKSaQ==}
     peerDependencies:
+      '@modelcontextprotocol/server': ^2.4.0
       zod: ^4.6.7
+    peerDependenciesMeta:
+      '@modelcontextprotocol/server':
+        optional: true
 
   '@ai-sdk/anthropic@3.0.85':
     resolution: {integrity: sha512-fNeDB644l5wbRNQU0FnI+F7UTtOenMnPtACfMPUJaS2zJfuBlseEa1TMg+otHkETZgaJB+6Na51NQEv0+m7czw==}
@@ -4562,7 +4566,7 @@ packages:
 
 snapshots:
 
-  '@agentclientprotocol/sdk@1.4.0(zod@4.6.7)':
+  '@agentclientprotocol/sdk@2.2.0(zod@4.6.7)':
     dependencies:
       zod: 4.6.7
 
