@@ -1,0 +1,998 @@
+import {existsSync, readFileSync, statSync} from 'fs';
+import {join} from 'path';
+import {type CliMode, VALID_MODES} from '@/app/types';
+import {substituteEnvVars} from '@/config/env-substitution';
+import {
+	loadAllMCPConfigs,
+	loadAllProviderConfigs,
+} from '@/config/mcp-config-loader';
+import {getConfigPath} from '@/config/paths';
+import {
+	getCiWatchPreference,
+	getNotificationsPreference,
+	loadPreferences,
+} from '@/config/preferences';
+import {ignoredDotenvWarning, loadProjectDotenv} from '@/config/project-dotenv';
+import {
+	DEFAULT_SESSION_CONFIG,
+	normalizeSessionConfig,
+} from '@/config/session-config';
+import {defaultTheme, getThemeColors} from '@/config/themes';
+import {
+	MAX_EMPTY_TURNS,
+	MAX_MALFORMED_RETRIES,
+	MAX_REPEATED_TOOL_CALLS,
+	MAX_TRUNCATED_TURNS,
+} from '@/constants';
+import {HOOK_EVENTS} from '@/types/config';
+import type {FirewallConfig} from '@/types/firewall';
+import type {
+	AppConfig,
+	AutoCompactConfig,
+	CiWatchConfig,
+	Colors,
+	CompressionMode,
+	CompressionStrategy,
+	DevelopmentMode,
+	FormatterDefinition,
+	HookDefinition,
+	HookEvent,
+	HooksConfig,
+	ModeProviderConfig,
+	NotificationsConfig,
+	PasteConfig,
+	ProviderConfig,
+	RetryLimitsConfig,
+	SystemPromptConfig,
+	TuneConfig,
+	VerifyConfig,
+} from '@/types/index';
+import {clampThreshold} from '@/utils/message-compression';
+import {logError, logWarning} from '@/utils/message-queue';
+import {DEFAULT_SINGLE_LINE_PASTE_THRESHOLD} from '@/utils/paste-utils';
+import {isTrustLevel} from '@/verify/trust';
+
+export {confDirMap, getClosestConfigFile} from '@/config/paths';
+export {DEFAULT_SESSION_CONFIG} from '@/config/session-config';
+
+// Load .env file from working directory (shell environment takes precedence).
+// Trust-related keys are dropped: this runs before the trust check.
+const dotenvResult = loadProjectDotenv(process.cwd());
+const dotenvWarning = ignoredDotenvWarning(dotenvResult.ignored);
+if (dotenvWarning) {
+	process.stderr.write(`${dotenvWarning}\n`);
+}
+
+type ConfigFileCacheEntry = {
+	mtimeMs: number;
+	size: number;
+	data: unknown;
+};
+
+const configFileCache = new Map<string, ConfigFileCacheEntry>();
+
+function readCachedConfigFile(configPath: string): unknown {
+	const stats = statSync(configPath);
+	const cached = configFileCache.get(configPath);
+
+	if (
+		cached &&
+		cached.mtimeMs === stats.mtimeMs &&
+		cached.size === stats.size
+	) {
+		return structuredClone(cached.data);
+	}
+
+	const data: unknown = JSON.parse(readFileSync(configPath, 'utf-8'));
+
+	configFileCache.set(configPath, {
+		mtimeMs: stats.mtimeMs,
+		size: stats.size,
+		data: structuredClone(data),
+	});
+
+	return data;
+}
+
+/**
+ * Read a JSON config file and hand the parsed contents to `extract`. Returns
+ * null when the file is missing, unparseable, or `extract` rejects it. The
+ * `label` only flavours the error log.
+ */
+function tryLoadConfig<T>(
+	configPath: string,
+	label: string,
+	// biome-ignore lint/suspicious/noExplicitAny: parsed JSON is dynamically shaped
+	extract: (config: any) => T | null,
+): T | null {
+	if (!existsSync(configPath)) {
+		return null;
+	}
+
+	try {
+		const config = readCachedConfigFile(configPath);
+		return extract(config);
+	} catch (error) {
+		logError(
+			`Failed to load ${label} config from ${configPath}: ${String(error)}`,
+		);
+	}
+
+	return null;
+}
+
+/**
+ * Resolve a config value with project-over-global precedence: try
+ * `<cwd>/<fileName>` first, then `<configDir>/<fileName>`. Returns null when
+ * neither file yields a value.
+ */
+function loadHierarchicalConfig<T>(
+	fileName: string,
+	label: string,
+	// biome-ignore lint/suspicious/noExplicitAny: parsed JSON is dynamically shaped
+	extract: (config: any) => T | null,
+): T | null {
+	const projectResult = tryLoadConfig(
+		join(process.cwd(), fileName), // nosemgrep
+		label,
+		extract,
+	);
+	if (projectResult !== null) {
+		return projectResult;
+	}
+
+	return tryLoadConfig(join(getConfigPath(), fileName), label, extract); // nosemgrep
+}
+
+/**
+ * Built-in auto-compact defaults. Exported so the effective-config resolver
+ * (`config/effective-config.ts`) can label a value as coming from the
+ * `default` layer without re-declaring the numbers.
+ *
+ * Loaders must return a **copy** of this and of the sibling DEFAULT_* objects,
+ * never the object itself: callers mutate the result of `getAppConfig()` (see
+ * `subagents/subagent-executor.spec.ts`), and handing out the shared constant
+ * lets one such write redefine the built-in default for the whole process —
+ * it even survives `reloadAppConfig()`.
+ * @public
+ */
+export const DEFAULT_AUTO_COMPACT_CONFIG: AutoCompactConfig = {
+	enabled: true,
+	threshold: 60,
+	mode: 'conservative',
+	strategy: 'llm',
+	notifyUser: true,
+};
+
+// Load auto-compact configuration and Returns default config if not specified
+function loadAutoCompactConfig(): AutoCompactConfig {
+	const defaults = DEFAULT_AUTO_COMPACT_CONFIG;
+
+	return (
+		loadHierarchicalConfig('agents.config.json', 'auto-compact', config => {
+			const autoCompact = config.nanocoder?.autoCompact;
+			if (autoCompact && typeof autoCompact === 'object') {
+				return {
+					enabled:
+						autoCompact.enabled !== undefined
+							? Boolean(autoCompact.enabled)
+							: defaults.enabled,
+					threshold: validateThreshold(
+						autoCompact.threshold ?? defaults.threshold,
+					),
+					mode: validateMode(autoCompact.mode ?? defaults.mode),
+					strategy: validateStrategy(autoCompact.strategy ?? defaults.strategy),
+					notifyUser:
+						autoCompact.notifyUser !== undefined
+							? Boolean(autoCompact.notifyUser)
+							: defaults.notifyUser,
+				};
+			}
+			return null;
+		}) ?? {...defaults}
+	);
+}
+
+// Load tune configuration from agents.config.json if it exists
+function loadTuneConfig(): Partial<TuneConfig> | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'tune', config => {
+			const tune = config.nanocoder?.tune;
+			if (tune && typeof tune === 'object') {
+				return tune as Partial<TuneConfig>;
+			}
+			return null;
+		}) ?? undefined
+	);
+}
+
+// Validate and clamp threshold to the configured range
+function validateThreshold(threshold: unknown): number {
+	const num = typeof threshold === 'number' ? threshold : 60;
+	return clampThreshold(Math.round(num));
+}
+
+// Validate compression mode
+function validateMode(mode: unknown): CompressionMode {
+	if (mode === 'default' || mode === 'aggressive' || mode === 'conservative') {
+		return mode;
+	}
+	return 'conservative';
+}
+
+// Validate compression strategy
+function validateStrategy(strategy: unknown): CompressionStrategy {
+	if (strategy === 'llm' || strategy === 'mechanical') {
+		return strategy;
+	}
+	return 'llm';
+}
+
+// Load session configuration and Returns default config if not specified
+function loadSessionConfig(): AppConfig['sessions'] {
+	return (
+		loadHierarchicalConfig('nanocoder-preferences.json', 'session', config =>
+			normalizeSessionConfig(config.nanocoder?.sessions),
+		) ?? {...DEFAULT_SESSION_CONFIG}
+	);
+}
+
+// Default ceiling on LLM turns for headless (--plain / ACP) conversations.
+// High enough that legitimate long iterative jobs finish, low enough that a
+// wedged model in CI can't run unbounded. Override via the NANOCODER_MAX_TURNS
+// env var or `nanocoder.headless.maxTurns` in agents.config.json.
+export const DEFAULT_HEADLESS_MAX_TURNS = 200;
+
+// Load headless conversation limits. Env var wins (handy for CI), then
+// agents.config.json, then the default.
+export const DEFAULT_HEADLESS_CONFIG: NonNullable<AppConfig['headless']> = {
+	maxTurns: DEFAULT_HEADLESS_MAX_TURNS,
+};
+
+function loadHeadlessConfig(): AppConfig['headless'] {
+	const defaults = DEFAULT_HEADLESS_CONFIG;
+
+	const envValue = process.env['NANOCODER_MAX_TURNS'];
+	if (envValue !== undefined && envValue.trim() !== '') {
+		const parsed = Number.parseInt(envValue, 10);
+		if (Number.isFinite(parsed) && parsed >= 1) {
+			return {maxTurns: parsed};
+		}
+	}
+
+	return (
+		loadHierarchicalConfig('agents.config.json', 'headless', config => {
+			const headless = config.nanocoder?.headless;
+			if (headless && typeof headless === 'object') {
+				const value = headless.maxTurns;
+				if (typeof value === 'number' && Number.isFinite(value)) {
+					return {maxTurns: Math.max(1, Math.round(value))};
+				}
+				return {...defaults};
+			}
+			return null;
+		}) ?? {...defaults}
+	);
+}
+
+// Load agent-loop retry limits from `nanocoder.retries` in agents.config.json.
+// Defaults mirror the historical hardcoded caps in constants.ts, so behaviour
+// is unchanged unless the user opts in. Distinct from the per-provider
+// `maxRetries` setting, which caps network request retries.
+export const DEFAULT_RETRY_LIMITS: RetryLimitsConfig = {
+	maxRepeatedToolCalls: MAX_REPEATED_TOOL_CALLS,
+	maxEmptyTurns: MAX_EMPTY_TURNS,
+	maxMalformedRetries: MAX_MALFORMED_RETRIES,
+	maxTruncatedTurns: MAX_TRUNCATED_TURNS,
+};
+
+function loadRetryLimitsConfig(): RetryLimitsConfig {
+	const defaults = DEFAULT_RETRY_LIMITS;
+
+	// A fresh tool-call signature already counts as 1 repeat, so a cap below 2
+	// would pause on every single tool call. The nudge/self-correction caps may
+	// go to 0 (= give up on the first failing turn).
+	//
+	// Deliberately unbounded above: a very large value is the supported way to
+	// opt out (a workflow that legitimately polls the same command). That also
+	// means a typo like 1000 silently disables the guard, which is the tradeoff
+	// taken over capping and second-guessing an explicit setting.
+	const normalizeLimit = (
+		value: unknown,
+		min: number,
+		fallback: number,
+	): number => {
+		if (typeof value === 'number' && Number.isFinite(value)) {
+			return Math.max(min, Math.round(value));
+		}
+		return fallback;
+	};
+
+	return (
+		loadHierarchicalConfig('agents.config.json', 'retries', config => {
+			const retries = config.nanocoder?.retries;
+			if (retries && typeof retries === 'object') {
+				return {
+					maxRepeatedToolCalls: normalizeLimit(
+						retries.maxRepeatedToolCalls,
+						2,
+						defaults.maxRepeatedToolCalls,
+					),
+					maxEmptyTurns: normalizeLimit(
+						retries.maxEmptyTurns,
+						0,
+						defaults.maxEmptyTurns,
+					),
+					maxMalformedRetries: normalizeLimit(
+						retries.maxMalformedRetries,
+						0,
+						defaults.maxMalformedRetries,
+					),
+					maxTruncatedTurns: normalizeLimit(
+						retries.maxTruncatedTurns,
+						0,
+						defaults.maxTruncatedTurns,
+					),
+				};
+			}
+			return null;
+		}) ?? {...defaults}
+	);
+}
+
+/**
+ * Built-in paste defaults. A function rather than a const because
+ * `@/utils/paste-utils` imports this module back, and reading
+ * DEFAULT_SINGLE_LINE_PASTE_THRESHOLD at module-evaluation time hits the
+ * temporal dead zone on whichever side of the cycle loads second. Deferring
+ * the read to call time is what the loader below always did.
+ * @public
+ */
+export function getDefaultPasteConfig(): PasteConfig {
+	return {singleLineThreshold: DEFAULT_SINGLE_LINE_PASTE_THRESHOLD};
+}
+
+// Load paste configuration and Returns default config if not specified
+function loadPasteConfig(): PasteConfig {
+	const defaults = getDefaultPasteConfig();
+
+	return (
+		loadHierarchicalConfig('nanocoder-preferences.json', 'paste', config => {
+			const paste = config.nanocoder?.paste;
+			if (paste && typeof paste === 'object') {
+				return {
+					singleLineThreshold:
+						typeof paste.singleLineThreshold === 'number' &&
+						Number.isFinite(paste.singleLineThreshold) &&
+						paste.singleLineThreshold > 0
+							? Math.round(paste.singleLineThreshold)
+							: defaults.singleLineThreshold,
+				};
+			}
+			return null;
+		}) ?? defaults
+	);
+}
+
+function loadNanocoderToolsConfig(): AppConfig['nanocoderTools'] {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'nanocoderTools', config => {
+			const nanocoderTools = config.nanocoder?.nanocoderTools;
+			if (nanocoderTools && typeof nanocoderTools === 'object') {
+				return substituteEnvVars(nanocoderTools);
+			}
+			return null;
+		}) ?? undefined
+	);
+}
+
+function loadSandboxConfig(): boolean {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'sandbox', config => {
+			const value = config.nanocoder?.sandbox;
+			if (value === true) return true;
+			if (value === false) return false;
+			if (value !== undefined) {
+				logWarning(
+					`nanocoder.sandbox must be true or false (got ${JSON.stringify(value)}); treating as off`,
+				);
+				return false;
+			}
+			return null;
+		}) ?? false
+	);
+}
+
+function loadAutoCommitConfig(): boolean {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'autoCommit', config => {
+			const value = config.nanocoder?.autoCommit;
+			if (value === true) return true;
+			if (value === false) return false;
+			if (value !== undefined) {
+				logWarning(
+					`nanocoder.autoCommit must be true or false (got ${JSON.stringify(value)}); treating as off`,
+				);
+				return false;
+			}
+			return null;
+		}) ?? false
+	);
+}
+
+function loadFirewallConfig(): Partial<FirewallConfig> | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'firewall', config => {
+			const fw = config.nanocoder?.firewall;
+			if (fw && typeof fw === 'object') {
+				return fw;
+			}
+			return null;
+		}) ?? undefined
+	);
+}
+
+function loadAlwaysAllowConfig(): string[] | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'alwaysAllow', config => {
+			const alwaysAllow = config.nanocoder?.alwaysAllow;
+			if (Array.isArray(alwaysAllow)) {
+				return alwaysAllow.filter(
+					(item: unknown): item is string => typeof item === 'string',
+				);
+			}
+			return null;
+		}) ?? undefined
+	);
+}
+
+function loadDisabledToolsConfig(): string[] | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'disabledTools', config => {
+			const disabledTools = config.nanocoder?.disabledTools;
+			if (Array.isArray(disabledTools)) {
+				return disabledTools.filter(
+					(item: unknown): item is string => typeof item === 'string',
+				);
+			}
+			return null;
+		}) ?? undefined
+	);
+}
+
+// User-defined LSP servers. Entries without a name, command or languages list
+// are dropped rather than handed to the LSP manager half-formed.
+function loadLspServersConfig(): AppConfig['lspServers'] {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'lspServers', config => {
+			const lspServers = config.nanocoder?.lspServers;
+			if (!Array.isArray(lspServers)) {
+				return null;
+			}
+			const valid: NonNullable<AppConfig['lspServers']> = [];
+			for (const server of lspServers) {
+				if (
+					!server ||
+					typeof server.name !== 'string' ||
+					typeof server.command !== 'string' ||
+					!Array.isArray(server.languages)
+				) {
+					continue;
+				}
+				valid.push({
+					name: server.name,
+					command: server.command,
+					args: Array.isArray(server.args)
+						? server.args.filter(
+								(arg: unknown): arg is string => typeof arg === 'string',
+							)
+						: undefined,
+					languages: server.languages.filter(
+						(lang: unknown): lang is string => typeof lang === 'string',
+					),
+					env:
+						server.env && typeof server.env === 'object'
+							? server.env
+							: undefined,
+				});
+			}
+			return valid;
+		}) ?? undefined
+	);
+}
+
+function loadSystemPromptConfig(): SystemPromptConfig | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'systemPrompt', config => {
+			const systemPrompt = config.nanocoder?.systemPrompt;
+			if (!systemPrompt || typeof systemPrompt !== 'object') {
+				return null;
+			}
+
+			const result: SystemPromptConfig = {};
+			if (systemPrompt.mode === 'replace' || systemPrompt.mode === 'append') {
+				result.mode = systemPrompt.mode;
+			}
+			if (typeof systemPrompt.content === 'string') {
+				result.content = systemPrompt.content;
+			}
+			if (typeof systemPrompt.file === 'string') {
+				result.file = systemPrompt.file;
+			}
+
+			if (result.content === undefined && result.file === undefined) {
+				return null;
+			}
+
+			return result;
+		}) ?? undefined
+	);
+}
+
+/**
+ * Parse one hook entry, dropping anything that isn't a usable shell command.
+ * Invalid entries are skipped rather than failing the whole config — a typo in
+ * one hook must not take the session down.
+ */
+function parseHookDefinition(raw: unknown): HookDefinition | null {
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+	const entry = raw as Record<string, unknown>;
+	const command = entry.command;
+	if (typeof command !== 'string' || command.trim() === '') return null;
+
+	const definition: HookDefinition = {command};
+
+	// A bare string is accepted as a one-item list. Dropping it silently would
+	// widen a scoped guard to every tool.
+	const rawMatchTools =
+		typeof entry.matchTools === 'string'
+			? [entry.matchTools]
+			: entry.matchTools;
+	if (Array.isArray(rawMatchTools)) {
+		const matchTools = rawMatchTools.filter(
+			(item: unknown): item is string =>
+				typeof item === 'string' && item.trim() !== '',
+		);
+		if (matchTools.length > 0) {
+			definition.matchTools = matchTools;
+		} else {
+			logWarning(
+				`Hook "${command}" has an empty matchTools list, so it runs for every tool. Remove matchTools to make that explicit, or list the tools to scope it.`,
+			);
+		}
+	}
+
+	const rawMatchPaths =
+		typeof entry.matchPaths === 'string'
+			? [entry.matchPaths]
+			: entry.matchPaths;
+	if (Array.isArray(rawMatchPaths)) {
+		const matchPaths = rawMatchPaths.filter(
+			(item: unknown): item is string =>
+				typeof item === 'string' && item.trim() !== '',
+		);
+		if (matchPaths.length > 0) {
+			definition.matchPaths = matchPaths;
+		} else {
+			logWarning(
+				`Hook "${command}" has an empty matchPaths list, so it is not scoped by path.`,
+			);
+		}
+	}
+
+	if (typeof entry.timeout === 'number' && Number.isFinite(entry.timeout)) {
+		definition.timeout = Math.max(1, Math.round(entry.timeout));
+	}
+
+	if (typeof entry.name === 'string' && entry.name.trim() !== '') {
+		definition.name = entry.name.trim();
+	}
+
+	return definition;
+}
+
+function loadHooksConfig(): HooksConfig | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'hooks', config => {
+			const hooks = config.nanocoder?.hooks;
+			if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) {
+				return null;
+			}
+
+			const result: HooksConfig = {};
+			for (const [event, entries] of Object.entries(hooks)) {
+				if (!(HOOK_EVENTS as readonly string[]).includes(event)) {
+					logError(`Invalid hooks config: unknown lifecycle event '${event}'.`);
+					continue;
+				}
+				if (!Array.isArray(entries)) {
+					logError(`Invalid hooks config: '${event}' must be an array.`);
+					continue;
+				}
+
+				const parsed = entries
+					.map(parseHookDefinition)
+					.filter((hook): hook is HookDefinition => hook !== null);
+				if (parsed.length !== entries.length) {
+					logError(
+						`Invalid hooks config: '${event}' has entries without a 'command' string.`,
+					);
+				}
+				if (parsed.length > 0) result[event as HookEvent] = parsed;
+			}
+
+			// No env substitution here: hook commands are shell strings, so
+			// `$NANOCODER_FILE` and friends must survive to the shell that runs
+			// them rather than being expanded (to nothing) at config-load time.
+			return Object.keys(result).length > 0 ? result : null;
+		}) ?? undefined
+	);
+}
+
+/**
+ * Parse one formatter entry. Like hooks, an invalid entry is dropped with an
+ * error rather than failing the whole config.
+ */
+function parseFormatterDefinition(raw: unknown): FormatterDefinition | null {
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+	const entry = raw as Record<string, unknown>;
+	const command = entry.command;
+	if (typeof command !== 'string' || command.trim() === '') return null;
+
+	const rawMatch =
+		typeof entry.match === 'string' ? [entry.match] : entry.match;
+	const match = Array.isArray(rawMatch)
+		? rawMatch.filter(
+				(item: unknown): item is string =>
+					typeof item === 'string' && item.trim() !== '',
+			)
+		: [];
+	// Unlike a hook, a formatter with no `match` is not widened to every file:
+	// running `prettier --write` on a Go file is never what was meant.
+	if (match.length === 0) return null;
+
+	const definition: FormatterDefinition = {match, command};
+	if (typeof entry.timeout === 'number' && Number.isFinite(entry.timeout)) {
+		definition.timeout = Math.max(1, Math.round(entry.timeout));
+	}
+	if (typeof entry.name === 'string' && entry.name.trim() !== '') {
+		definition.name = entry.name.trim();
+	}
+	return definition;
+}
+
+function loadFormattersConfig(): FormatterDefinition[] | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'formatters', config => {
+			const formatters = config.nanocoder?.formatters;
+			if (!Array.isArray(formatters)) return null;
+
+			const parsed = formatters
+				.map(parseFormatterDefinition)
+				.filter(
+					(formatter): formatter is FormatterDefinition => formatter !== null,
+				);
+			if (parsed.length !== formatters.length) {
+				logError(
+					"Invalid formatters config: entries need a 'command' string and a non-empty 'match' glob list.",
+				);
+			}
+
+			// No env substitution, for the same reason as hooks: `$FILE` must
+			// reach the shell rather than being expanded at config-load time.
+			return parsed;
+		}) ?? undefined
+	);
+}
+
+function loadModeProvidersConfig(
+	providers: ProviderConfig[],
+): Partial<Record<DevelopmentMode, ModeProviderConfig>> | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'modeProviders', config => {
+			const modeProviders = config.nanocoder?.modeProviders;
+			if (
+				!modeProviders ||
+				typeof modeProviders !== 'object' ||
+				Array.isArray(modeProviders)
+			) {
+				return null;
+			}
+
+			const result: Partial<Record<DevelopmentMode, ModeProviderConfig>> = {};
+
+			for (const [mode, config] of Object.entries(modeProviders)) {
+				if (!(VALID_MODES as readonly string[]).includes(mode)) {
+					logError(`Invalid modeProviders config: unknown mode '${mode}'.`);
+					continue;
+				}
+
+				// Typecast to unknown first, then check object structure
+				const typedConfig = config as Record<string, unknown>;
+				if (!typedConfig || typeof typedConfig !== 'object') continue;
+
+				const providerName =
+					typeof typedConfig.provider === 'string'
+						? typedConfig.provider
+						: undefined;
+				const modelName =
+					typeof typedConfig.model === 'string' ? typedConfig.model : undefined;
+
+				if (!providerName || !modelName) {
+					logError(
+						`Invalid modeProviders config for mode '${mode}': missing provider or model string.`,
+					);
+					continue;
+				}
+
+				const matchedProvider = providers.find(
+					p => p.name.toLowerCase() === providerName.toLowerCase(),
+				);
+				if (!matchedProvider) {
+					logError(
+						`Invalid modeProviders config for mode '${mode}': provider '${providerName}' not found in configured providers.`,
+					);
+					continue;
+				}
+
+				if (
+					matchedProvider.models.length > 0 &&
+					!matchedProvider.models.includes(modelName)
+				) {
+					logError(
+						`Invalid modeProviders config for mode '${mode}': model '${modelName}' not found in models for provider '${matchedProvider.name}'.`,
+					);
+					continue;
+				}
+
+				result[mode as DevelopmentMode] = {
+					provider: matchedProvider.name,
+					model: modelName,
+				};
+			}
+
+			return Object.keys(result).length > 0 ? result : null;
+		}) ?? undefined
+	);
+}
+
+// Load notifications configuration from preferences
+function loadNotificationsConfig(): NotificationsConfig | undefined {
+	return getNotificationsPreference();
+}
+
+// Load project-level verify policy (trust level, poll cadence overrides)
+// from agents.config.json. Unlike ciWatch.enabled (a personal, per-machine
+// opt-in kept in preferences), trust level and cadence are security/policy
+// decisions appropriate to commit and review with the rest of the project.
+function loadVerifyConfig(): VerifyConfig | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'verify', config => {
+			const verify = config.nanocoder?.verify;
+			if (!verify || typeof verify !== 'object') return null;
+			const result: VerifyConfig = {};
+			if (isTrustLevel(verify.trustLevel)) {
+				result.trustLevel = verify.trustLevel;
+			}
+			if (typeof verify.pollIntervalMs === 'number') {
+				result.pollIntervalMs = verify.pollIntervalMs;
+			}
+			if (typeof verify.maxPollIntervalMs === 'number') {
+				result.maxPollIntervalMs = verify.maxPollIntervalMs;
+			}
+			return Object.keys(result).length > 0 ? result : null;
+		}) ?? undefined
+	);
+}
+
+// Load CI-watch configuration: `enabled` always comes from preferences (a
+// personal opt-in); `pollIntervalMs`/`maxPollIntervalMs` prefer the
+// project-level `verify` overrides from agents.config.json when set, since
+// poll cadence is more appropriately a reviewable project policy.
+function loadCiWatchConfig(): CiWatchConfig | undefined {
+	const preferencesValue = getCiWatchPreference();
+	const projectOverrides = loadVerifyConfig();
+	if (!preferencesValue && !projectOverrides) return undefined;
+	return {
+		enabled: preferencesValue?.enabled ?? false,
+		pollIntervalMs:
+			projectOverrides?.pollIntervalMs ?? preferencesValue?.pollIntervalMs,
+		maxPollIntervalMs:
+			projectOverrides?.maxPollIntervalMs ??
+			preferencesValue?.maxPollIntervalMs,
+	};
+}
+
+export function loadDefaultMode(): CliMode | undefined {
+	return (
+		loadHierarchicalConfig('agents.config.json', 'defaultMode', config => {
+			const defaultMode = config.nanocoder?.defaultMode;
+			if (typeof defaultMode === 'string') {
+				const normalized = defaultMode.toLowerCase().trim();
+				if ((VALID_MODES as readonly string[]).includes(normalized)) {
+					return normalized as CliMode;
+				}
+			}
+			return null;
+		}) ?? undefined
+	);
+}
+
+// Function to load app configuration from agents.config.json if it exists
+function loadAppConfig(): AppConfig {
+	// Load providers from the new hierarchical configuration system
+	const providers = loadAllProviderConfigs();
+
+	// Load MCP servers from the new hierarchical configuration system
+	const mcpServersWithSource = loadAllMCPConfigs();
+	// Keep provenance on the runtime objects: validateProjectConfigSecurity
+	// filters on MCPServerConfig.source, which the loader only tracks on the wrapper.
+	const mcpServers = mcpServersWithSource.map(item => ({
+		...item.server,
+		source: item.source,
+	}));
+
+	// Load auto-compact configuration
+	const autoCompact = loadAutoCompactConfig();
+
+	// Load session configuration
+	const sessions = loadSessionConfig();
+
+	// Load headless conversation limits
+	const headless = loadHeadlessConfig();
+
+	// Load agent-loop retry limits
+	const retries = loadRetryLimitsConfig();
+
+	// Load paste configuration
+	const paste = loadPasteConfig();
+
+	// Load nanocoder tools configuration
+	const nanocoderTools = loadNanocoderToolsConfig();
+
+	// Load top-level alwaysAllow (for non-interactive mode and as fallback)
+	const alwaysAllow = loadAlwaysAllowConfig();
+
+	// Load top-level disabledTools (filtered out of every tool-availability path)
+	const disabledTools = loadDisabledToolsConfig();
+
+	// Load custom system prompt override
+	const systemPrompt = loadSystemPromptConfig();
+
+	// Load lifecycle hooks (shell commands run at fixed points in the agent loop)
+	const hooks = loadHooksConfig();
+
+	// Load formatters (run on files the agent writes, before post-tool-use)
+	const formatters = loadFormattersConfig();
+
+	// Load notifications configuration
+	const notifications = loadNotificationsConfig();
+	// Load project-level verify policy (must load before ciWatch, which
+	// layers its poll-cadence overrides on top of the preferences value)
+	const verify = loadVerifyConfig();
+	// Load CI-watch configuration
+	const ciWatch = loadCiWatchConfig();
+
+	// Load mode providers configuration
+	const modeProviders = loadModeProvidersConfig(providers);
+	// Load project-level tune defaults from agents.config.json
+	const tune = loadTuneConfig();
+
+	const sandbox = loadSandboxConfig();
+
+	const autoCommit = loadAutoCommitConfig();
+
+	const firewall = loadFirewallConfig();
+
+	// Load user-defined LSP servers (auto-discovery still runs alongside)
+	const lspServers = loadLspServersConfig();
+
+	return {
+		providers,
+		mcpServers,
+		lspServers,
+		autoCompact,
+		sessions,
+		headless,
+		retries,
+		paste,
+		nanocoderTools,
+		alwaysAllow,
+		disabledTools,
+		systemPrompt,
+		hooks,
+		formatters,
+		notifications,
+		ciWatch,
+		verify,
+		modeProviders,
+		tune,
+		sandbox,
+		autoCommit,
+		firewall,
+	};
+}
+
+let _appConfig: AppConfig | null = null;
+
+/**
+ * Bumped whenever the cached config is dropped or reloaded.
+ *
+ * Modules that derive something expensive from config (a constructed client,
+ * say) cache it against this number instead of re-deriving on every read. They
+ * cannot simply be reset from here: the interesting ones sit above config in
+ * the import graph, and reaching down to them would give this module - which
+ * everything imports - a cycle back through client-factory.
+ */
+let _configGeneration = 0;
+
+/**
+ * How many times the config has been dropped or reloaded this process.
+ *
+ * Fold it into a cache key to have that cache follow config edits. A key built
+ * only from the config values a module reads misses changes underneath them:
+ * `titleProvider: "ollama"` is the same string before and after its baseURL is
+ * edited, but it no longer names the same endpoint.
+ * @public
+ */
+export function getConfigGeneration(): number {
+	return _configGeneration;
+}
+
+/**
+ * Lazy-loaded app config to avoid circular dependencies during module initialization
+ * @public
+ */
+export function getAppConfig(): AppConfig {
+	if (!_appConfig) {
+		_appConfig = loadAppConfig();
+	}
+	return _appConfig;
+}
+
+/**
+ * Agent-loop retry limits, read live from the current app config so runtime
+ * edits (and tests that mutate `getAppConfig().retries`) are picked up.
+ *
+ * The fallback is applied per field, not to the object as a whole: a `retries`
+ * object missing one key would otherwise hand callers `undefined`, and every
+ * `count >= limit` guard reading it evaluates false, silently disabling the
+ * very cap this feature exists to enforce.
+ * @public
+ */
+export function getRetryLimits(): RetryLimitsConfig {
+	const retries = getAppConfig().retries;
+	return {
+		maxRepeatedToolCalls:
+			retries?.maxRepeatedToolCalls ?? MAX_REPEATED_TOOL_CALLS,
+		maxEmptyTurns: retries?.maxEmptyTurns ?? MAX_EMPTY_TURNS,
+		maxMalformedRetries: retries?.maxMalformedRetries ?? MAX_MALFORMED_RETRIES,
+		maxTruncatedTurns: retries?.maxTruncatedTurns ?? MAX_TRUNCATED_TURNS,
+	};
+}
+
+// Function to reload the app configuration (useful after config file changes)
+export function reloadAppConfig(): void {
+	configFileCache.clear();
+	_appConfig = loadAppConfig();
+	_configGeneration++;
+}
+
+export function clearAppConfig(): void {
+	configFileCache.clear();
+	_appConfig = null;
+	_configGeneration++;
+}
+
+let cachedColors: Colors | null = null;
+
+export function getColors(): Colors {
+	if (!cachedColors) {
+		const preferences = loadPreferences();
+		const selectedTheme = preferences.selectedTheme || defaultTheme;
+		cachedColors = getThemeColors(selectedTheme);
+	}
+	return cachedColors;
+}

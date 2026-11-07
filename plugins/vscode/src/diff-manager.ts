@@ -1,0 +1,442 @@
+import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
+import {PendingChange, FileChangeMessage} from './protocol';
+
+// Custom URI scheme for virtual documents (won't trigger linters)
+const DIFF_SCHEME = 'nanocoder-diff';
+
+/**
+ * Content provider for virtual diff documents
+ * Using virtual documents prevents VS Code from running linters on them
+ */
+class DiffContentProvider implements vscode.TextDocumentContentProvider {
+	private contents: Map<string, string> = new Map();
+	private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+	readonly onDidChange = this._onDidChange.event;
+
+	setContent(uri: vscode.Uri, content: string): void {
+		this.contents.set(uri.toString(), content);
+		this._onDidChange.fire(uri);
+	}
+
+	removeContent(uri: vscode.Uri): void {
+		this.contents.delete(uri.toString());
+	}
+
+	provideTextDocumentContent(uri: vscode.Uri): string {
+		return this.contents.get(uri.toString()) || '';
+	}
+
+	dispose(): void {
+		this.contents.clear();
+		this._onDidChange.dispose();
+	}
+}
+
+/**
+ * Manages file diffs and change previews
+ */
+export class DiffManager {
+	private pendingChanges: Map<string, PendingChange> = new Map();
+	private openEditors: Map<string, vscode.Uri[]> = new Map();
+	private onChangeCallbacks: Set<() => void> = new Set();
+	private contentProvider: DiffContentProvider;
+
+	constructor(private context: vscode.ExtensionContext) {
+		// Register the virtual document provider
+		this.contentProvider = new DiffContentProvider();
+		context.subscriptions.push(
+			vscode.workspace.registerTextDocumentContentProvider(
+				DIFF_SCHEME,
+				this.contentProvider,
+			),
+		);
+	}
+
+	/**
+	 * Add a new pending file change
+	 */
+	addPendingChange(message: FileChangeMessage): void {
+		const change: PendingChange = {
+			id: message.id,
+			filePath: message.filePath,
+			originalContent: message.originalContent,
+			newContent: message.newContent,
+			toolName: message.toolName,
+			timestamp: Date.now(),
+		};
+
+		this.pendingChanges.set(message.id, change);
+		this.notifyChanges();
+	}
+
+	/**
+	 * Get all pending changes
+	 */
+	getPendingChanges(): PendingChange[] {
+		return Array.from(this.pendingChanges.values()).sort(
+			(a, b) => a.timestamp - b.timestamp,
+		);
+	}
+
+	/**
+	 * Get a specific pending change
+	 */
+	getPendingChange(id: string, filePath?: string): PendingChange | undefined {
+		if (filePath) {
+			const norm = path.normalize(filePath);
+			return (
+				this.pendingChanges.get(`${id}_${norm}`) ??
+				Array.from(this.pendingChanges.values()).find(
+					c =>
+						(c.id === id || c.id.startsWith(`${id}_`)) &&
+						path.normalize(c.filePath) === norm,
+				)
+			);
+		}
+		return (
+			this.pendingChanges.get(id) ??
+			Array.from(this.pendingChanges.values()).find(c =>
+				c.id.startsWith(`${id}_`),
+			)
+		);
+	}
+
+	/**
+	 * Create a virtual URI for diff content (won't trigger linters)
+	 */
+	private createVirtualUri(
+		id: string,
+		type: 'original' | 'modified' | 'new',
+		fileName: string,
+	): vscode.Uri {
+		// Include the file extension in the path for syntax highlighting
+		// but use our custom scheme so linters don't run
+		return vscode.Uri.parse(`${DIFF_SCHEME}:/${id}/${type}/${fileName}`);
+	}
+
+	/**
+	 * Show diff preview for a pending change
+	 * Uses virtual documents to prevent linters from running
+	 * Optionally preserves terminal focus by restoring it after showing the diff (default: false).
+	 * If filePath is specified, opens only the change matching that file under id.
+	 * If given a bare toolCallId matching multiple compound-keyed changes without filePath, fans out and opens all matching diff tabs.
+	 */
+	async showDiff(
+		id: string,
+		options?: { restoreTerminalFocus?: boolean; filePath?: string },
+	): Promise<void> {
+		let change = this.pendingChanges.get(id);
+		let targetId = id;
+
+		if (!change && options?.filePath) {
+			const norm = path.normalize(options.filePath);
+			const compoundKey = `${id}_${norm}`;
+			change = this.pendingChanges.get(compoundKey);
+			if (change) {
+				targetId = compoundKey;
+			} else {
+				const match = Array.from(this.pendingChanges.values()).find(
+					c =>
+						(c.id === id || c.id.startsWith(`${id}_`)) &&
+						path.normalize(c.filePath) === norm,
+				);
+				if (match) {
+					change = match;
+					targetId = match.id;
+				}
+			}
+		}
+
+		if (!change) {
+			const matchingChanges = Array.from(this.pendingChanges.values()).filter(c =>
+				c.id.startsWith(`${id}_`),
+			);
+			if (matchingChanges.length > 0) {
+				for (const match of matchingChanges) {
+					await this.showDiff(match.id, options);
+				}
+				return;
+			}
+			vscode.window.showErrorMessage(`Change ${id} not found`);
+			return;
+		}
+
+		const restoreTerminal = options?.restoreTerminalFocus ?? false;
+		// Remember the active terminal before showing diff
+		const activeTerminal = restoreTerminal ? vscode.window.activeTerminal : undefined;
+
+		const fileName = path.basename(change.filePath);
+		const isNewFile = change.originalContent === '';
+
+		// For new files, show the content directly with syntax highlighting
+		if (isNewFile) {
+			const modifiedUri = this.createVirtualUri(targetId, 'new', fileName);
+
+			// Set content in our virtual document provider
+			this.contentProvider.setContent(modifiedUri, change.newContent);
+
+			// Track this editor
+			this.openEditors.set(targetId, [modifiedUri]);
+
+			// Open the new file content for preview
+			const doc = await vscode.workspace.openTextDocument(modifiedUri);
+			await vscode.window.showTextDocument(doc, {
+				preview: true,
+				preserveFocus: true,
+			});
+
+			// Restore terminal focus only if explicitly requested
+			if (activeTerminal) {
+				await vscode.commands.executeCommand('workbench.action.terminal.focus');
+			}
+
+			return;
+		}
+
+		// For existing files, show diff using virtual documents
+		const originalUri = this.createVirtualUri(targetId, 'original', fileName);
+		const modifiedUri = this.createVirtualUri(targetId, 'modified', fileName);
+
+		// Set content in our virtual document provider
+		this.contentProvider.setContent(originalUri, change.originalContent);
+		this.contentProvider.setContent(modifiedUri, change.newContent);
+
+		// Track these editors
+		this.openEditors.set(targetId, [originalUri, modifiedUri]);
+
+		// Open diff editor with preserveFocus to avoid stealing terminal focus
+		const title = `Nanocoder: ${fileName} (${change.toolName})`;
+		await vscode.commands.executeCommand(
+			'vscode.diff',
+			originalUri,
+			modifiedUri,
+			title,
+			{preview: true, preserveFocus: true},
+		);
+
+		// Restore terminal focus only if explicitly requested
+		if (activeTerminal) {
+			await vscode.commands.executeCommand('workbench.action.terminal.focus');
+		}
+	}
+
+	/**
+	 * Clear all pending changes and close associated virtual diff editors
+	 */
+	async clearPendingChanges(): Promise<void> {
+		const ids = Array.from(this.pendingChanges.keys());
+		for (const id of ids) {
+			try {
+				await this.closeEditors(id);
+			} catch {
+				// Ignore errors from individual editor closures to ensure all entries are processed
+			}
+		}
+		this.pendingChanges.clear();
+		this.notifyChanges();
+	}
+
+	/**
+	 * Close diff for a pending change (called when CLI confirms/rejects)
+	 */
+	async closeDiff(id: string): Promise<void> {
+		if (this.pendingChanges.has(id)) {
+			try {
+				await this.closeEditors(id);
+			} catch {
+				// Ignore errors if editors were already closed
+			}
+			this.removePendingChange(id);
+			return;
+		}
+
+		const matchingIds = Array.from(this.pendingChanges.keys()).filter(k =>
+			k.startsWith(`${id}_`),
+		);
+		for (const mid of matchingIds) {
+			try {
+				await this.closeEditors(mid);
+			} catch {
+				// Ignore errors if editors were already closed
+			}
+			this.removePendingChange(mid);
+		}
+	}
+
+	/**
+	 * Close diff editors associated with a change
+	 */
+	private async closeEditors(id: string): Promise<void> {
+		const uris = this.openEditors.get(id);
+		if (!uris) {
+			return;
+		}
+
+		// Close all tabs showing these URIs
+		const allTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs);
+
+		for (const tab of allTabs) {
+			let shouldClose = false;
+			const input = tab.input;
+
+			if (input instanceof vscode.TabInputText) {
+				// Check if this is one of our virtual documents
+				shouldClose = uris.some(uri => uri.toString() === input.uri.toString());
+			} else if (input instanceof vscode.TabInputTextDiff) {
+				// Check if this is our diff editor
+				shouldClose =
+					uris.some(uri => uri.toString() === input.original.toString()) ||
+					uris.some(uri => uri.toString() === input.modified.toString());
+			}
+
+			if (shouldClose) {
+				try {
+					await vscode.window.tabGroups.close(tab);
+				} catch {
+					// Ignore errors if tab was already closed or disposed
+				}
+			}
+		}
+
+		// Clean up virtual document content
+		for (const uri of uris) {
+			this.contentProvider.removeContent(uri);
+		}
+
+		this.openEditors.delete(id);
+	}
+
+	/**
+	 * Apply a pending change to the actual file
+	 */
+	async applyChange(id: string): Promise<boolean> {
+		const change = this.pendingChanges.get(id);
+		if (!change) {
+			vscode.window.showErrorMessage(`Change ${id} not found`);
+			return false;
+		}
+
+		try {
+			// Close diff editors first
+			await this.closeEditors(id);
+
+			const uri = vscode.Uri.file(change.filePath);
+
+			// Check if file exists
+			const fileExists = fs.existsSync(change.filePath);
+
+			if (fileExists) {
+				// Open the document and apply changes
+				const document = await vscode.workspace.openTextDocument(uri);
+				const edit = new vscode.WorkspaceEdit();
+				const fullRange = new vscode.Range(
+					document.positionAt(0),
+					document.positionAt(document.getText().length),
+				);
+				edit.replace(uri, fullRange, change.newContent);
+				await vscode.workspace.applyEdit(edit);
+				await document.save();
+			} else {
+				// Create new file
+				const dirPath = path.dirname(change.filePath);
+				if (!fs.existsSync(dirPath)) {
+					fs.mkdirSync(dirPath, {recursive: true});
+				}
+				fs.writeFileSync(change.filePath, change.newContent, 'utf-8');
+
+				// Open the new file
+				const document = await vscode.workspace.openTextDocument(uri);
+				await vscode.window.showTextDocument(document);
+			}
+
+			// Remove from pending
+			this.removePendingChange(id);
+
+			vscode.window.showInformationMessage(
+				`Applied changes to ${path.basename(change.filePath)}`,
+			);
+			return true;
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Failed to apply changes: ${
+					error instanceof Error ? error.message : error
+				}`,
+			);
+			return false;
+		}
+	}
+
+	/**
+	 * Reject a pending change
+	 */
+	async rejectChange(id: string): Promise<boolean> {
+		const change = this.pendingChanges.get(id);
+		if (!change) {
+			return false;
+		}
+
+		// Close diff editors first
+		await this.closeEditors(id);
+
+		this.removePendingChange(id);
+
+		vscode.window.showInformationMessage(
+			`Rejected changes to ${path.basename(change.filePath)}`,
+		);
+		return true;
+	}
+
+	/**
+	 * Remove a pending change from tracking
+	 * Note: Virtual document cleanup is handled in closeEditors()
+	 */
+	private removePendingChange(id: string): void {
+		if (this.pendingChanges.has(id)) {
+			this.pendingChanges.delete(id);
+			this.notifyChanges();
+		}
+	}
+
+	/**
+	 * Apply all pending changes
+	 */
+	async applyAll(): Promise<void> {
+		const changes = this.getPendingChanges();
+		for (const change of changes) {
+			await this.applyChange(change.id);
+		}
+	}
+
+	/**
+	 * Reject all pending changes
+	 */
+	async rejectAll(): Promise<void> {
+		const ids = Array.from(this.pendingChanges.keys());
+		for (const id of ids) {
+			await this.rejectChange(id);
+		}
+	}
+
+	/**
+	 * Subscribe to changes in pending changes list
+	 */
+	onChanges(callback: () => void): vscode.Disposable {
+		this.onChangeCallbacks.add(callback);
+		return new vscode.Disposable(() => {
+			this.onChangeCallbacks.delete(callback);
+		});
+	}
+
+	private notifyChanges(): void {
+		this.onChangeCallbacks.forEach(callback => callback());
+	}
+
+	/**
+	 * Cleanup virtual document provider
+	 */
+	dispose(): void {
+		this.contentProvider.dispose();
+	}
+}

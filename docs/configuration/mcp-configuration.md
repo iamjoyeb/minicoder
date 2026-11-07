@@ -1,0 +1,310 @@
+---
+title: "MCP Configuration"
+description: "Configure Model Context Protocol servers to extend Nanocoder's capabilities"
+sidebar_order: 3
+---
+
+# MCP Server Configuration
+
+Configure [Model Context Protocol](https://github.com/modelcontextprotocol/servers) (MCP) servers to extend Nanocoder with external tools.
+
+## Quick Start
+
+Create a `.mcp.json` file in your project root:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./src"],
+      "alwaysAllow": ["list_directory", "read_file"]
+    },
+    "github": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "$GITHUB_TOKEN"
+      }
+    },
+    "context7": {
+      "transport": "http",
+      "url": "https://mcp.context7.com/mcp",
+      "timeout": 30000
+    }
+  }
+}
+```
+
+Use `/mcp` to view connected servers and their tools. Use `/settings mcp` for interactive setup.
+
+## Optional: Local-First Cross-Session Memory
+
+Nanocoder does not persist conversation context between separate runs. If you
+want durable notes about a project, you can opt into a local-first memory MCP
+server without changing Nanocoder itself.
+
+The following example uses [Vestige](https://github.com/samvallad33/vestige),
+but the same configuration shape works with any memory server that provides an
+MCP `stdio` interface:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "vestige-mcp-server"],
+      "description": "Optional local-first cross-session memory"
+    }
+  }
+}
+```
+
+Add the entry to your project or global `.mcp.json`, then use `/mcp` to check
+that the server connected. The available tool names and memory workflow depend
+on the server you choose; Nanocoder only starts the MCP process and exposes
+its tools to the model.
+
+Before enabling a memory server, review its documentation and configuration:
+
+- Confirm where it stores data and whether it makes any network requests.
+- Treat stored prompts, code, and decisions as sensitive project data.
+- Do not add memory-writing tools to `alwaysAllow` unless you explicitly want
+  them to run without confirmation.
+- A third-party example in this section is optional and is not an official
+  Nanocoder integration or endorsement.
+
+> **Tool visibility note:** Connected MCP servers may be hidden from the model by the current `/tune` tool profile. MCP tools are available to the model only when the resolved profile is `full`; the default `auto` profile switches small local models to `minimal` or `nano`, which intentionally filters MCP tools to keep the prompt small. If `/mcp` shows a server but the model cannot call its tools, run `/tune` and set **Tool Profile** to **full** (or switch to a larger/cloud model so `auto` resolves to `full`).
+
+## Config File Locations
+
+| Location | File | Purpose |
+|----------|------|---------|
+| **Project** | `.mcp.json` in project root | Project-specific servers, shared via version control |
+| **Global** | `.mcp.json` in `~/.config/nanocoder/` (Linux), `~/Library/Preferences/nanocoder/` (macOS), or `%APPDATA%\nanocoder\` (Windows) | Personal servers across all projects |
+
+Both are loaded together. When the same server name exists in both, the project-level config takes precedence.
+
+### Environment Variable Overrides
+
+You can also define MCP servers via environment variables. These take **highest precedence**, overriding both project and global configs when the same server name exists.
+
+| Variable | Description |
+|----------|-------------|
+| `NANOCODER_MCPSERVERS` | JSON string containing MCP server configurations |
+| `NANOCODER_MCPSERVERS_FILE` | Path to a JSON file (used if `NANOCODER_MCPSERVERS` is not set) |
+
+The JSON value accepts either a direct array or the standard `mcpServers` wrapper format:
+
+**Direct array format:**
+
+```bash
+export NANOCODER_MCPSERVERS='[{"name":"my-server","transport":"http","url":"https://example.com/mcp"}]'
+```
+
+**Wrapper format (same as `.mcp.json`):**
+
+```bash
+export NANOCODER_MCPSERVERS='{"mcpServers":{"my-server":{"transport":"http","url":"https://example.com/mcp"}}}'
+```
+
+**File-based:**
+
+```bash
+export NANOCODER_MCPSERVERS_FILE=/path/to/mcp-servers.json
+```
+
+**Precedence order:** Environment variables > Project `.mcp.json` > Global `.mcp.json`
+
+## Transport Types
+
+### stdio
+
+Spawns a local process and communicates via stdin/stdout. Used for most MCP servers.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `transport` | Yes | `"stdio"` |
+| `command` | Yes | Command to execute (e.g. `npx`, `uvx`, `python`) |
+| `args` | No | Array of command-line arguments |
+| `env` | No | Environment variables passed to the process |
+
+```json
+{
+  "custom-tools": {
+    "transport": "stdio",
+    "command": "python",
+    "args": ["path/to/mcp_server.py"],
+    "env": {
+      "API_KEY": "${API_KEY:-default-key}"
+    }
+  }
+}
+```
+
+> **Note:** For `uvx` commands, Nanocoder automatically adds `--native-tls` to use system certificates, fixing TLS issues in corporate proxy environments.
+
+### http
+
+Connects to remote servers using the MCP StreamableHTTP protocol.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `transport` | Yes | `"http"` |
+| `url` | Yes | Server endpoint (`http://` or `https://`) |
+| `headers` | No | HTTP headers (useful for authentication) |
+| `timeout` | No | Connection timeout in milliseconds (see [Common Fields](#common-fields)) |
+
+```json
+{
+  "github-remote": {
+    "transport": "http",
+    "url": "https://api.githubcopilot.com/mcp/",
+    "headers": {
+      "Authorization": "Bearer $GITHUB_TOKEN"
+    },
+    "timeout": 30000
+  }
+}
+```
+
+### websocket
+
+Connects to remote servers via persistent WebSocket connections.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `transport` | Yes | `"websocket"` |
+| `url` | Yes | Server endpoint (`ws://` or `wss://`) |
+| `timeout` | No | Connection timeout in milliseconds (see [Common Fields](#common-fields)) |
+
+```json
+{
+  "realtime-data": {
+    "transport": "websocket",
+    "url": "wss://api.example.com/mcp"
+  }
+}
+```
+
+## Common Fields
+
+These fields work with all transport types:
+
+| Field | Description |
+|-------|-------------|
+| `description` | Human-readable description shown in `/mcp` output |
+| `alwaysAllow` | Array of tool names that skip confirmation prompts |
+| `enabled` | Whether the server is active (default: `true`). `false` skips it entirely — no connection, no tools registered |
+| `timeout` | Connection timeout in milliseconds. Bounds the connection handshake and the initial tool listing; individual tool calls keep the MCP SDK's default timeout (60 seconds) |
+| `healthCheckInterval` | Optional MCP ping interval in milliseconds (default: `30000`). Set to `0` to disable health pings entirely, including the liveness ping that otherwise follows a transport error. Health pings use `timeout` when configured, otherwise 10 seconds, and are skipped while a tool call or resource read is in flight on that server. Two failed pings in a row, or a transport close, mark the server unhealthy and remove its tools; unhealthy servers continue to be checked with exponential backoff and automatically restore their tools when they respond again. After a transport close (for example a crashed stdio server), Nanocoder reconnects from the server's config with the same backoff, using this interval as the base delay (30 seconds when it is `0`). |
+| `tags` | Array of tags, shown as `#tag` labels in `/mcp` output |
+
+## Auto-Approve Tools
+
+The `alwaysAllow` field specifies MCP tools that execute without confirmation in normal mode:
+
+```json
+{
+  "filesystem": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "./src"],
+    "alwaysAllow": ["list_directory", "read_file", "file_info"]
+  }
+}
+```
+
+- Tools in `alwaysAllow` skip the confirmation prompt in normal mode
+- Tools not listed still require approval
+- In auto-accept and yolo modes, all MCP tools run without confirmation regardless
+- Only auto-approve read-only tools; avoid auto-approving tools that modify files or execute commands
+
+### How `alwaysAllow` interacts with development modes
+
+`alwaysAllow` is a **normal-mode** setting. It is not a global exemption — the
+[development mode](../features/development-modes.md) decides first:
+
+| Mode | MCP tool behaviour | Does `alwaysAllow` apply? |
+|------|--------------------|---------------------------|
+| `normal` | Prompts for confirmation | **Yes** — listed tools skip the prompt |
+| `auto-accept` | Runs without confirmation | No — everything already runs |
+| `yolo` | Runs without confirmation | No — everything already runs |
+| `plan` | Only tools the server annotates `readOnlyHint: true` are available at all; the rest are hidden | **No** — it cannot re-enable a mutating tool |
+| `headless` | Runs without confirmation | No — everything already runs |
+
+Two consequences worth calling out:
+
+- **`alwaysAllow` cannot override plan mode.** Plan mode exists to inspect a
+  model's intentions without side effects, so listing a mutating tool there has
+  no effect. Availability in plan mode is decided solely by the server's
+  `readOnlyHint` annotation, and a tool with no annotation is treated as a
+  possible mutation and hidden. Note this is only about *availability*:
+  `readOnlyHint` is supplied by the same server being gated, so it is confined
+  to that one decision. It never skips a confirmation prompt in normal mode
+  (only your `alwaysAllow` list does that), never suppresses a checkpoint before
+  the call, and never promotes the tool into a parallel batch.
+- **Headless runs every MCP tool unattended, with no per-server opt-out.**
+  Headless is the internal mode the daemon uses for triggered skill runs, where
+  no user is present to answer a prompt. MCP tools there behave like
+  `execute_bash` and the file tools. This is deliberately more permissive than
+  [custom tools](../features/custom-tools.md), which must declare
+  `approval: never` to run in headless. If a server exposes tools you do not
+  want a triggered run to reach, gate it at the server level — set
+  `"enabled": false`, or don't configure that server in a project whose skills
+  run under the daemon.
+
+## Resources and Prompts
+
+A server can also declare MCP resources and prompts, alongside tools:
+
+- **Resources** join the local file list under the `@` mention trigger — type `@` and fuzzy-search filenames and connected servers' resources together. Selecting one reads it from the server and inlines its content the same way a file mention does — including the same size guard: a resource over the inline line limit is truncated to a head preview instead of being dumped in full, so a single `@`-mention can't flood the conversation.
+- **Prompts** are invoked as `/mcp:<server>:<prompt>`, shown alongside custom commands in the `/` completion menu. Unlike a custom command's static template, the prompt is fetched fresh from the server on every call — arguments are filled in positionally, in the order the server declares them, and the result is sent as the next chat turn.
+
+Both are gated on the server's declared capabilities: a server that doesn't declare `resources` or `prompts` in its `initialize` response is never sent a `resources/list` or `prompts/list` request, and just contributes none — same as a server with no tools.
+
+## Environment Variables
+
+Use environment variable references to keep credentials out of config files:
+
+```json
+{
+  "env": {
+    "TOKEN": "$TOKEN",
+    "API_URL": "${API_URL}",
+    "FALLBACK": "${MISSING_VAR:-default-value}"
+  }
+}
+```
+
+Supported syntax: `$VAR`, `${VAR}`, `${VAR:-default}`. Variable names must be uppercase (letters, digits and underscores); a lowercase reference such as `$token` is left as literal text.
+
+> **Security:** Project-level `.mcp.json` files are typically version controlled. Always use environment variable references for sensitive values.
+
+## Setup Wizard
+
+Run `/settings mcp` for interactive configuration with:
+
+- Pre-configured templates for popular servers (Filesystem, GitHub, Brave Search, DuckDuckGo, You.com, Serply, FXMacroData, Context7, DeepWiki, Playwright, etc.)
+- Custom server setup for stdio, HTTP, and WebSocket
+- Edit or delete existing servers
+- **Ctrl+E** to open the config file in your system editor
+
+## Troubleshooting
+
+**stdio servers:**
+- _Command not found_ — Verify the command is in your PATH. Nanocoder shows install hints for common tools (`npx`, `uvx`, `python`).
+- _Permission denied_ — Check execute permissions on the command/script.
+
+**Remote servers (HTTP/WebSocket):**
+- _Connection failed_ — Verify the URL is accessible. Test with `curl` for HTTP servers.
+- _Authentication errors_ — For HTTP, use `headers` with a Bearer token or API key. Ensure env vars are set.
+
+**General:**
+- _Transport type mismatch_ — Ensure `transport` matches your server (`stdio` for local commands, `http`/`websocket` for remote URLs).
+- _Environment variables_ - Ensure all `$VAR` references resolve. Unset variables resolve to empty strings (with an error in the log), and lowercase names are not substituted at all.
+
+For more servers and community configurations, see the [MCP servers repository](https://github.com/modelcontextprotocol/servers).

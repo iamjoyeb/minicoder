@@ -1,0 +1,62 @@
+import {agentTool} from '@/tools/agent-tool';
+import {askQuestionTool} from '@/tools/ask-question';
+import {browserTool} from '@/tools/browser';
+import {executeBashTool} from '@/tools/execute-bash';
+import {fetchUrlTool} from '@/tools/fetch-url';
+import {getFileOpTools} from '@/tools/file-ops';
+import {diffEditTool} from '@/tools/file-ops/diff-edit';
+import {stringReplaceTool} from '@/tools/file-ops/string-replace';
+import {writeFileTool} from '@/tools/file-ops/write-file';
+import {findFilesTool} from '@/tools/find-files';
+import {getGitTools} from '@/tools/git';
+import {listDirectoryTool} from '@/tools/list-directory';
+import {formatDocumentTool} from '@/tools/lsp-format-document';
+import {getDiagnosticsTool} from '@/tools/lsp-get-diagnostics';
+import {readFileTool} from '@/tools/read-file';
+import {searchFileContentsTool} from '@/tools/search-file-contents';
+import {checkSkillTool} from '@/tools/skill-check';
+import {writeTasksTool} from '@/tools/tasks';
+import {webSearchTool} from '@/tools/web-search';
+import {writePlanTool} from '@/tools/write-plan';
+import {writeWalkthroughTool} from '@/tools/write-walkthrough';
+import type {NanocoderToolExport} from '@/types/index';
+
+// Static tools (always available)
+const staticTools: NanocoderToolExport[] = [
+	readFileTool,
+	writeFileTool,
+	stringReplaceTool,
+	diffEditTool,
+	executeBashTool,
+	webSearchTool,
+	fetchUrlTool,
+	browserTool,
+	findFilesTool,
+	searchFileContentsTool,
+	getDiagnosticsTool,
+	formatDocumentTool,
+	listDirectoryTool,
+	agentTool,
+	// Interaction tools
+	askQuestionTool,
+	// File operation tools
+	...getFileOpTools(),
+	// Task management tool
+	writeTasksTool,
+	// Plan mode artifact tool
+	writePlanTool,
+	// Completion artifact tool
+	writeWalkthroughTool,
+	// Skill authoring linter
+	checkSkillTool,
+];
+
+// Conditionally available tools (based on system capabilities).
+// Git tools are only registered if git is installed; the PR tool
+// additionally requires gh CLI. Built lazily — evaluating this at import
+// time spawned git/gh and blocked the first frame (#1819); the underlying
+// availability checks are now spawn-free, and callers invoke this when the
+// registry is actually constructed.
+export function getAllToolExports(): NanocoderToolExport[] {
+	return [...staticTools, ...getGitTools()];
+}

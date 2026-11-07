@@ -1,0 +1,3230 @@
+
+import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,mkdtempSync,utimesSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import * as path from 'node:path';
+import test from 'ava';
+import fs from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
+import {
+	describeProjectTrust,
+	TRUST_FINGERPRINT_VERSION,
+} from '@/config/project-trust';
+import {
+	DEFAULT_MEMORY_LIMIT,
+	DEFAULT_TOKEN_BUDGET,
+	MAX_MEMORY_LIMIT,
+	MAX_TOKEN_BUDGET,
+	MIN_MEMORY_LIMIT,
+	MIN_TOKEN_BUDGET,
+} from '@/memory/project-context';
+import {getClosestConfigFile} from '@/config/index';
+import {
+	directoryTrustRefusal,
+	ensureDirectoryTrust,
+	grantDirectoryTrust,
+	getCompactToolDisplay,
+	getLastUsedModel,
+	getNanocoderShape,
+	getNotificationsPreference,
+	getPasteThreshold,
+	getProfessionalTone,
+	getProjectContextPreferences,
+	getReasoningExpanded,
+	getSemanticMemoryEnabled,
+	isDirectoryTrusted,
+	loadPreferences,
+	resolveProjectContextPreferences,
+	resetPreferencesCache,
+	savePreferences,
+	getShowAgentBashOutput,
+	getShowUsageFooter,
+	updateCompactToolDisplay,
+	updateLastUsed,
+	updateNanocoderShape,
+	updateNotificationsPreference,
+	updatePasteThreshold,
+	updateProfessionalTone,
+	updateReasoningExpanded,
+	updateSemanticMemoryEnabled,
+	updateSemanticMemoryLimit,
+	updateSemanticMemoryTokenBudget,
+	getPrivacyPreference,
+	updatePrivacyPreference,
+	getMouseReporting,
+	updateMouseReporting,
+	updateShowAgentBashOutput,
+	updateShowUsageFooter,
+	trustRecheck,
+	getPreferencesVersion,
+	subscribeToPreferences,
+	DEFAULT_MAX_FPS,
+	MIN_MAX_FPS,
+	MAX_MAX_FPS,
+	isValidMaxFps,
+	getUiMaxFps,
+	getMaxFps,
+} from './preferences';
+import {
+	updatePreferencesNestedValue,
+	writeConfigFileAtomic,
+} from '@/config/config-writer';
+import type {UserPreferences} from '@/types/index';
+
+console.log('\npreferences.spec.ts');
+
+// Use environment variable to isolate config directory for tests
+const testConfigDir = join(tmpdir(), `nanocoder-test-config-${Date.now()}`);
+
+test.before(() => {
+	// Set config directory for all tests
+	process.env.NANOCODER_CONFIG_DIR = testConfigDir;
+	mkdirSync(testConfigDir, {recursive: true});
+	// Reset the preferences cache to pick up the new config directory
+	resetPreferencesCache();
+});
+
+test.beforeEach(() => {
+	resetPreferencesCache();
+});
+
+test.after.always(() => {
+	// Clean up test config directory
+	if (existsSync(testConfigDir)) {
+		rmSync(testConfigDir, {recursive: true, force: true});
+	}
+	// Clean up environment
+	delete process.env.NANOCODER_CONFIG_DIR;
+	// Reset the cache to restore normal behavior
+	resetPreferencesCache();
+});
+
+// Helper to get the preferences file path
+const getTestPreferencesPath = () => join(testConfigDir, 'nanocoder-preferences.json');
+
+// ============================================================================
+// loadPreferences Tests
+// ============================================================================
+
+test.serial('loadPreferences loads valid JSON file', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const validPreferences: UserPreferences = {
+		lastProvider: 'openrouter',
+		lastModel: 'anthropic/claude-3-opus',
+		providerModels: {
+			openrouter: 'anthropic/claude-3-opus',
+		},
+	};
+
+	writeFileSync(preferencesPath, JSON.stringify(validPreferences, null, 2), 'utf-8');
+
+	try {
+		const result = loadPreferences();
+
+		t.deepEqual(result, validPreferences);
+		t.is(result.lastProvider, 'openrouter');
+		t.is(result.lastModel, 'anthropic/claude-3-opus');
+		t.is(result.providerModels?.openrouter, 'anthropic/claude-3-opus');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('loadPreferences returns empty object when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = loadPreferences();
+
+	t.deepEqual(result, {});
+});
+
+test.serial('loadPreferences returns empty object for invalid JSON', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	writeFileSync(preferencesPath, '{ invalid json }', 'utf-8');
+
+	try {
+		const result = loadPreferences();
+
+		t.deepEqual(result, {});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('loadPreferences returns empty object for empty file', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	writeFileSync(preferencesPath, '', 'utf-8');
+
+	try {
+		const result = loadPreferences();
+
+		t.deepEqual(result, {});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('loadPreferences returns empty object for JSON with syntax errors', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	writeFileSync(preferencesPath, '{"lastProvider": "test",}', 'utf-8');
+
+	try {
+		const result = loadPreferences();
+
+		t.deepEqual(result, {});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// savePreferences Tests
+// ============================================================================
+
+test.serial('savePreferences writes JSON file with proper formatting', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		lastProvider: 'openrouter',
+		lastModel: 'anthropic/claude-3-sonnet',
+		providerModels: {
+			openrouter: 'anthropic/claude-3-sonnet',
+		},
+	};
+
+	try {
+		savePreferences(preferences);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.deepEqual(parsed, preferences);
+		// Check formatting (should have indentation)
+		t.true(content.includes('\n'));
+		t.true(content.includes('  ')); // Indented with 2 spaces
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('savePreferences creates new file if it does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+	const preferences: UserPreferences = {lastProvider: 'test'};
+
+	try {
+		savePreferences(preferences);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'test');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('savePreferences overwrites existing file', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	// Create initial file
+	const initialPreferences: UserPreferences = {lastProvider: 'initial'};
+	writeFileSync(preferencesPath, JSON.stringify(initialPreferences, null, 2), 'utf-8');
+
+	const newPreferences: UserPreferences = {
+		lastProvider: 'updated',
+		lastModel: 'new-model',
+	};
+
+	try {
+		savePreferences(newPreferences);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'updated');
+		t.is(parsed.lastModel, 'new-model');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('savePreferences saves all UserPreferences fields', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		lastProvider: 'openrouter',
+		lastModel: 'claude-3-opus',
+		selectedTheme: 'tokyo-night',
+		trustedDirectories: ['/home/user/project'],
+		lastUpdateCheck: 1234567890,
+	};
+
+	try {
+		savePreferences(preferences);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.selectedTheme, 'tokyo-night');
+		t.deepEqual(parsed.trustedDirectories, ['/home/user/project']);
+		t.is(parsed.lastUpdateCheck, 1234567890);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// updateLastUsed Tests
+// ============================================================================
+
+test.serial('updateLastUsed saves provider and model', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateLastUsed('openrouter', 'anthropic/claude-3-opus');
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.lastModel, 'anthropic/claude-3-opus');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateLastUsed creates providerModels object if not exists', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	// Start with empty preferences file
+	writeFileSync(preferencesPath, '{}', 'utf-8');
+
+	try {
+		updateLastUsed('openrouter', 'anthropic/claude-3-opus');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.truthy(parsed.providerModels);
+		t.is(parsed.providerModels?.openrouter, 'anthropic/claude-3-opus');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateLastUsed preserves existing providerModels', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingPreferences: UserPreferences = {
+		providerModels: {
+			existing: 'existing-model',
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingPreferences, null, 2), 'utf-8');
+
+	try {
+		updateLastUsed('newprovider', 'new-model');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.providerModels?.existing, 'existing-model');
+		t.is(parsed.providerModels?.newprovider, 'new-model');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateLastUsed overwrites model for same provider', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingPreferences: UserPreferences = {
+		providerModels: {
+			openrouter: 'old-model',
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingPreferences, null, 2), 'utf-8');
+
+	try {
+		updateLastUsed('openrouter', 'new-model');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.providerModels?.openrouter, 'new-model');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateLastUsed handles multiple providers', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateLastUsed('provider1', 'model1');
+		updateLastUsed('provider2', 'model2');
+		updateLastUsed('provider1', 'model1-updated');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'provider1');
+		t.is(parsed.lastModel, 'model1-updated');
+		t.is(parsed.providerModels?.provider1, 'model1-updated');
+		t.is(parsed.providerModels?.provider2, 'model2');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// getLastUsedModel Tests
+// ============================================================================
+
+test.serial('getLastUsedModel returns model for known provider', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		providerModels: {
+			openrouter: 'anthropic/claude-3-opus',
+			ollama: 'llama3',
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		t.is(getLastUsedModel('openrouter'), 'anthropic/claude-3-opus');
+		t.is(getLastUsedModel('ollama'), 'llama3');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getLastUsedModel returns undefined for unknown provider', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		providerModels: {
+			openrouter: 'anthropic/claude-3-opus',
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		t.is(getLastUsedModel('unknown'), undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getLastUsedModel returns undefined when providerModels is missing', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		t.is(getLastUsedModel('openrouter'), undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getLastUsedModel returns undefined when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	t.is(getLastUsedModel('openrouter'), undefined);
+});
+
+test.serial('getLastUsedModel returns undefined for empty providerModels object', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		providerModels: {},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		t.is(getLastUsedModel('any-provider'), undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Integration Tests - Full Workflow
+// ============================================================================
+
+test.serial('full workflow: update and retrieve last used model', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		// Update last used
+		updateLastUsed('openrouter', 'claude-3-opus');
+
+		// Retrieve via getLastUsedModel
+		const retrieved = getLastUsedModel('openrouter');
+
+		t.is(retrieved, 'claude-3-opus');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: load returns previously saved preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const original: UserPreferences = {
+		lastProvider: 'test-provider',
+		lastModel: 'test-model',
+		providerModels: {
+			'provider-a': 'model-a',
+			'provider-b': 'model-b',
+		},
+	};
+
+	try {
+		savePreferences(original);
+		const loaded = loadPreferences();
+
+		t.deepEqual(loaded, original);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Edge Cases Tests
+// ============================================================================
+
+test.serial('preferences handles null and undefined values', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		lastProvider: undefined,
+		lastModel: undefined,
+		providerModels: {
+			test: undefined,
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		const loaded = loadPreferences();
+		t.is(loaded.lastProvider, undefined);
+		t.is(loaded.lastModel, undefined);
+		t.is(loaded.providerModels?.test, undefined);
+		t.is(getLastUsedModel('test'), undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('preferences preserves additional UserPreferences fields', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		lastProvider: 'openrouter',
+		lastModel: 'claude-3-opus',
+		selectedTheme: 'tokyo-night',
+		trustedDirectories: ['/home/user/project'],
+		lastUpdateCheck: 1234567890,
+	};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		const loaded = loadPreferences();
+		t.is(loaded.selectedTheme, 'tokyo-night');
+		t.deepEqual(loaded.trustedDirectories, ['/home/user/project']);
+		t.is(loaded.lastUpdateCheck, 1234567890);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateLastUsed can be called multiple times for same provider', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		// First call
+		updateLastUsed('provider1', 'model1');
+
+		// Second call for same provider
+		updateLastUsed('provider1', 'model2');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'provider1');
+		t.is(parsed.lastModel, 'model2');
+		t.is(parsed.providerModels?.provider1, 'model2');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('savePreferences handles minimal UserPreferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {};
+
+	try {
+		savePreferences(preferences);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content);
+
+		t.deepEqual(parsed, {});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('loadPreferences handles file with only whitespace', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	writeFileSync(preferencesPath, '   \n\n  \n  ', 'utf-8');
+
+	try {
+		const result = loadPreferences();
+
+		t.deepEqual(result, {});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// updateNanocoderShape Tests
+// ============================================================================
+
+test.serial('updateNanocoderShape saves nanocoder shape', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateNanocoderShape('block');
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoderShape, 'block');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateNanocoderShape preserves existing preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingPreferences: UserPreferences = {
+		lastProvider: 'openrouter',
+		lastModel: 'claude-3-opus',
+		selectedTheme: 'tokyo-night',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingPreferences, null, 2), 'utf-8');
+
+	try {
+		updateNanocoderShape('chrome');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoderShape, 'chrome');
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.lastModel, 'claude-3-opus');
+		t.is(parsed.selectedTheme, 'tokyo-night');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateNanocoderShape overwrites existing nanocoder shape', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingPreferences: UserPreferences = {
+		nanocoderShape: 'tiny',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingPreferences, null, 2), 'utf-8');
+
+	try {
+		updateNanocoderShape('huge');
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoderShape, 'huge');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// getNanocoderShape Tests
+// ============================================================================
+
+test.serial('getNanocoderShape returns saved nanocoder shape', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {
+		nanocoderShape: 'slick',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		const result = getNanocoderShape();
+		t.is(result, 'slick');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getNanocoderShape returns undefined when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {};
+	writeFileSync(preferencesPath, JSON.stringify(preferences, null, 2), 'utf-8');
+
+	try {
+		const result = getNanocoderShape();
+		t.is(result, undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getNanocoderShape returns undefined when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = getNanocoderShape();
+	t.is(result, undefined);
+});
+
+test.serial('full workflow: update and retrieve nanocoder shape', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateNanocoderShape('grid');
+		const retrieved = getNanocoderShape();
+		t.is(retrieved, 'grid');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// getPasteThreshold Tests
+// ============================================================================
+
+test.serial('getPasteThreshold returns threshold from nanocoder.paste.singleLineThreshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		lastProvider: 'openrouter',
+		nanocoder: {
+			paste: {
+				singleLineThreshold: 1500,
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getPasteThreshold();
+		t.is(result, 1500);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getPasteThreshold returns undefined when paste is missing', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(preferencesPath, JSON.stringify({lastProvider: 'test'}, null, 2), 'utf-8');
+
+	try {
+		const result = getPasteThreshold();
+		t.is(result, undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getPasteThreshold returns undefined when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = getPasteThreshold();
+	t.is(result, undefined);
+});
+
+test.serial('getPasteThreshold returns undefined for non-positive threshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		nanocoder: {
+			paste: {
+				singleLineThreshold: -100,
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getPasteThreshold();
+		t.is(result, undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getPasteThreshold returns undefined for zero threshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		nanocoder: {
+			paste: {
+				singleLineThreshold: 0,
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getPasteThreshold();
+		t.is(result, undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getPasteThreshold rounds non-integer thresholds', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data = {
+		nanocoder: {
+			paste: {
+				singleLineThreshold: 1234.7,
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getPasteThreshold();
+		t.is(result, 1235);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getPasteThreshold returns undefined for non-number threshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data = {
+		nanocoder: {
+			paste: {
+				singleLineThreshold: 'not-a-number',
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getPasteThreshold();
+		t.is(result, undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// updatePasteThreshold Tests
+// ============================================================================
+
+test.serial('updatePasteThreshold saves threshold to nanocoder.paste.singleLineThreshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updatePasteThreshold(2000);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoder?.paste?.singleLineThreshold, 2000);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updatePasteThreshold preserves existing preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingData: UserPreferences = {
+		lastProvider: 'openrouter',
+		lastModel: 'claude-3-opus',
+		selectedTheme: 'tokyo-night',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingData, null, 2), 'utf-8');
+
+	try {
+		updatePasteThreshold(1500);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.lastModel, 'claude-3-opus');
+		t.is(parsed.selectedTheme, 'tokyo-night');
+		t.is(parsed.nanocoder?.paste?.singleLineThreshold, 1500);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updatePasteThreshold overwrites existing paste threshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingData: UserPreferences = {
+		nanocoder: {
+			paste: {
+				singleLineThreshold: 800,
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingData, null, 2), 'utf-8');
+
+	try {
+		updatePasteThreshold(1000);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoder?.paste?.singleLineThreshold, 1000);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updatePasteThreshold rounds non-integer values', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updatePasteThreshold(1234.7);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoder?.paste?.singleLineThreshold, 1235);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updatePasteThreshold creates file if it does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updatePasteThreshold(500);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.nanocoder?.paste?.singleLineThreshold, 500);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Paste Threshold Integration Tests
+// ============================================================================
+
+test.serial('full workflow: update and retrieve paste threshold', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updatePasteThreshold(2000);
+		const retrieved = getPasteThreshold();
+		t.is(retrieved, 2000);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updatePasteThreshold does not overwrite other preferences saved via savePreferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		// Save regular preferences first
+		savePreferences({lastProvider: 'ollama', lastModel: 'llama3'});
+
+		// Then update paste threshold
+		updatePasteThreshold(400);
+
+		// Both should coexist
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'ollama');
+		t.is(parsed.lastModel, 'llama3');
+		t.is(parsed.nanocoder?.paste?.singleLineThreshold, 400);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Notification Preferences Tests
+// ============================================================================
+
+test.serial('getNotificationsPreference returns undefined when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(preferencesPath, JSON.stringify({lastProvider: 'test'}, null, 2), 'utf-8');
+
+	try {
+		const result = getNotificationsPreference();
+		t.is(result, undefined);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getNotificationsPreference returns undefined when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = getNotificationsPreference();
+	t.is(result, undefined);
+});
+
+test.serial('getNotificationsPreference returns saved config', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		notifications: {
+			enabled: true,
+			sound: false,
+			events: {
+				toolConfirmation: true,
+				questionPrompt: true,
+				generationComplete: false,
+			},
+		},
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getNotificationsPreference();
+		t.truthy(result);
+		t.is(result!.enabled, true);
+		t.is(result!.sound, false);
+		t.is(result!.events?.toolConfirmation, true);
+		t.is(result!.events?.generationComplete, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateNotificationsPreference saves config at top level', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateNotificationsPreference({enabled: true, sound: true});
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.notifications?.enabled, true);
+		t.is(parsed.notifications?.sound, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateNotificationsPreference preserves existing preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingData: UserPreferences = {
+		lastProvider: 'openrouter',
+		selectedTheme: 'tokyo-night',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingData, null, 2), 'utf-8');
+
+	try {
+		updateNotificationsPreference({enabled: false});
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.selectedTheme, 'tokyo-night');
+		t.is(parsed.notifications?.enabled, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: update and retrieve notifications', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateNotificationsPreference({enabled: true, sound: false, timeout: 5000});
+		const retrieved = getNotificationsPreference();
+
+		t.truthy(retrieved);
+		t.is(retrieved!.enabled, true);
+		t.is(retrieved!.sound, false);
+		t.is(retrieved!.timeout, 5000);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Reasoning Expanded Tests
+// ============================================================================
+
+test.serial('getReasoningExpanded returns false when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(preferencesPath, JSON.stringify({lastProvider: 'test'}, null, 2), 'utf-8');
+
+	try {
+		const result = getReasoningExpanded();
+		t.is(result, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getReasoningExpanded returns false when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = getReasoningExpanded();
+	t.is(result, false);
+});
+
+test.serial('getReasoningExpanded returns true when set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		reasoningExpanded: true,
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getReasoningExpanded();
+		t.is(result, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateReasoningExpanded saves false value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateReasoningExpanded(false);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.reasoningExpanded, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateReasoningExpanded saves true value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateReasoningExpanded(true);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.reasoningExpanded, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateReasoningExpanded preserves existing preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingData: UserPreferences = {
+		lastProvider: 'openrouter',
+		selectedTheme: 'tokyo-night',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingData, null, 2), 'utf-8');
+
+	try {
+		updateReasoningExpanded(true);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.selectedTheme, 'tokyo-night');
+		t.is(parsed.reasoningExpanded, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: update and retrieve reasoning expanded', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateReasoningExpanded(true);
+		const retrieved = getReasoningExpanded();
+		t.is(retrieved, true);
+
+		updateReasoningExpanded(false);
+		const retrieved2 = getReasoningExpanded();
+		t.is(retrieved2, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Compact Tool Display Tests
+// ============================================================================
+
+test.serial('getCompactToolDisplay returns true when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(preferencesPath, JSON.stringify({lastProvider: 'test'}, null, 2), 'utf-8');
+
+	try {
+		const result = getCompactToolDisplay();
+		t.is(result, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getCompactToolDisplay returns true when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = getCompactToolDisplay();
+	t.is(result, true);
+});
+
+test.serial('getCompactToolDisplay returns false when set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		compactToolDisplay: false,
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		const result = getCompactToolDisplay();
+		t.is(result, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateCompactToolDisplay saves false value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateCompactToolDisplay(false);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.compactToolDisplay, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateCompactToolDisplay saves true value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateCompactToolDisplay(true);
+
+		t.true(existsSync(preferencesPath));
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.compactToolDisplay, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateCompactToolDisplay preserves existing preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existingData: UserPreferences = {
+		lastProvider: 'openrouter',
+		reasoningExpanded: true,
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existingData, null, 2), 'utf-8');
+
+	try {
+		updateCompactToolDisplay(false);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.lastProvider, 'openrouter');
+		t.is(parsed.reasoningExpanded, true);
+		t.is(parsed.compactToolDisplay, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: update and retrieve compact tool display', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateCompactToolDisplay(false);
+		const retrieved = getCompactToolDisplay();
+		t.is(retrieved, false);
+
+		updateCompactToolDisplay(true);
+		const retrieved2 = getCompactToolDisplay();
+		t.is(retrieved2, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Display Settings Integration Tests
+// ============================================================================
+
+test.serial('display settings can be combined with other preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		// Set reasoning expanded
+		updateReasoningExpanded(true);
+		// Set compact tool display
+		updateCompactToolDisplay(false);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.reasoningExpanded, true);
+		t.is(parsed.compactToolDisplay, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: update and retrieve all display settings', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		// Set both display settings
+		updateReasoningExpanded(true);
+		updateCompactToolDisplay(false);
+
+		// Retrieve both
+		const reasoningResult = getReasoningExpanded();
+		const compactResult = getCompactToolDisplay();
+
+		t.is(reasoningResult, true);
+		t.is(compactResult, false);
+
+		// Toggle both
+		updateReasoningExpanded(false);
+		updateCompactToolDisplay(true);
+
+		// Verify toggles
+		t.is(getReasoningExpanded(), false);
+		t.is(getCompactToolDisplay(), true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Privacy Settings Tests
+// ============================================================================
+
+test.serial('getPrivacyPreference returns false when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {};
+	writeFileSync(preferencesPath, JSON.stringify(preferences), 'utf-8');
+
+	try {
+		const result = getPrivacyPreference();
+		t.is(result, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getPrivacyPreference returns true when set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {enablePromptScrubbing: true};
+	writeFileSync(preferencesPath, JSON.stringify(preferences), 'utf-8');
+
+	try {
+		const result = getPrivacyPreference();
+		t.is(result, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updatePrivacyPreference saves the preference correctly', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updatePrivacyPreference(true);
+
+		t.true(existsSync(preferencesPath));
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.enablePromptScrubbing, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: update and retrieve privacy preference', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updatePrivacyPreference(true);
+		const retrieved = getPrivacyPreference();
+		t.is(retrieved, true);
+
+		updatePrivacyPreference(false);
+		const retrieved2 = getPrivacyPreference();
+		t.is(retrieved2, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Mouse Reporting Tests
+// ============================================================================
+
+test.serial('getMouseReporting returns true by default when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	const result = getMouseReporting();
+	t.is(result, true);
+});
+
+test.serial('updateMouseReporting saves and retrieves preference correctly', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateMouseReporting(true);
+		t.is(getMouseReporting(), true);
+
+		updateMouseReporting(false);
+		t.is(getMouseReporting(), false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Usage Footer Tests
+// ============================================================================
+
+test.serial('getShowUsageFooter defaults to true when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(
+		preferencesPath,
+		JSON.stringify({lastProvider: 'test'}, null, 2),
+		'utf-8',
+	);
+
+	try {
+		t.is(getShowUsageFooter(), true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+test.serial('getShowUsageFooter defaults to true when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	t.is(getShowUsageFooter(), true);
+});
+
+test.serial('getShowUsageFooter returns false when explicitly disabled', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {showUsageFooter: false};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		t.is(getShowUsageFooter(), false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateShowUsageFooter preserves existing preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const existing: UserPreferences = {
+		lastProvider: 'ollama',
+		lastModel: 'qwen',
+	};
+	writeFileSync(preferencesPath, JSON.stringify(existing, null, 2), 'utf-8');
+
+	try {
+		updateShowUsageFooter(false);
+
+		const parsed = JSON.parse(
+			readFileSync(preferencesPath, 'utf-8'),
+		) as UserPreferences;
+		t.is(parsed.showUsageFooter, false);
+		t.is(parsed.lastProvider, 'ollama');
+		t.is(parsed.lastModel, 'qwen');
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: toggle usage footer off and back on', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateShowUsageFooter(false);
+		t.is(getShowUsageFooter(), false);
+
+		updateShowUsageFooter(true);
+		t.is(getShowUsageFooter(), true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// showAgentBashOutput Tests
+// ============================================================================
+
+test.serial('getShowAgentBashOutput defaults to false when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(
+		preferencesPath,
+		JSON.stringify({lastProvider: 'test'}, null, 2),
+		'utf-8',
+	);
+
+	try {
+		t.is(getShowAgentBashOutput(), false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getShowAgentBashOutput defaults to false when file does not exist', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	t.is(getShowAgentBashOutput(), false);
+});
+
+test.serial('updateShowAgentBashOutput round-trips and preserves others', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(
+		preferencesPath,
+		JSON.stringify({lastProvider: 'ollama'}, null, 2),
+		'utf-8',
+	);
+
+	try {
+		updateShowAgentBashOutput(true);
+		t.is(getShowAgentBashOutput(), true);
+		t.is(loadPreferences().lastProvider, 'ollama');
+
+		updateShowAgentBashOutput(false);
+		t.is(getShowAgentBashOutput(), false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getShowAgentBashOutput reflects a write, not a stale cached value', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	try {
+		// Self-priming, so the result does not depend on what earlier serial
+		// tests left in the cache. Without version-based invalidation the final
+		// read would still serve the primed `false`.
+		updateShowAgentBashOutput(false);
+		t.is(getShowAgentBashOutput(), false);
+
+		updateShowAgentBashOutput(true);
+		t.is(getShowAgentBashOutput(), true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getShowAgentBashOutput serves the cached value without re-reading', t => {
+	const preferencesPath = getTestPreferencesPath();
+
+	try {
+		updateShowAgentBashOutput(true);
+		t.is(getShowAgentBashOutput(), true);
+
+		// Remove the file behind the cache's back. A getter that re-read per call
+		// would fall back to the default (false); the cached one keeps serving
+		// true, which is what keeps a bash card render off the disk.
+		rmSync(preferencesPath, {force: true});
+		t.is(getShowAgentBashOutput(), true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// professionalTone Tests
+// ============================================================================
+
+test.serial('getProfessionalTone returns false when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	writeFileSync(
+		preferencesPath,
+		JSON.stringify({lastProvider: 'test'}, null, 2),
+		'utf-8',
+	);
+
+	try {
+		t.is(getProfessionalTone(), false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateProfessionalTone persists the value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateProfessionalTone(true);
+		t.is(getProfessionalTone(), true);
+		t.is(loadPreferences().professionalTone, true);
+
+		updateProfessionalTone(false);
+		t.is(getProfessionalTone(), false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateProfessionalTone preserves other preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	savePreferences({lastProvider: 'ollama', lastModel: 'qwen'});
+
+	try {
+		updateProfessionalTone(true);
+		const preferences = loadPreferences();
+		t.is(preferences.lastProvider, 'ollama');
+		t.is(preferences.lastModel, 'qwen');
+		t.is(preferences.professionalTone, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// Cross-writer non-clobbering: updatePreferencesNestedValue (sessions) and
+// updatePasteThreshold (paste) share the same file but write via different code
+// paths. Verify that writing one does not erase the other.
+
+test.serial(
+	'sessions writer does not clobber paste written by savePreferences',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+
+		try {
+			updatePasteThreshold(1500);
+			updatePreferencesNestedValue('sessions', 'maxMessages', 50);
+
+			const content = JSON.parse(
+				readFileSync(preferencesPath, 'utf-8'),
+			) as UserPreferences;
+
+			t.is(content.nanocoder?.paste?.singleLineThreshold, 1500);
+			t.is(content.nanocoder?.sessions?.maxMessages, 50);
+		} finally {
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial(
+	'paste writer via savePreferences does not clobber sessions',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+
+		try {
+			updatePreferencesNestedValue('sessions', 'retentionDays', 14);
+			updatePasteThreshold(2000);
+
+			const content = JSON.parse(
+				readFileSync(preferencesPath, 'utf-8'),
+			) as UserPreferences;
+
+			t.is(content.nanocoder?.sessions?.retentionDays, 14);
+			t.is(content.nanocoder?.paste?.singleLineThreshold, 2000);
+		} finally {
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial('getSemanticMemoryEnabled returns true when not set', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {};
+	writeFileSync(preferencesPath, JSON.stringify(preferences), 'utf-8');
+
+	try {
+		const result = getSemanticMemoryEnabled();
+		t.is(result, true);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('getSemanticMemoryEnabled returns false when disabled', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const preferences: UserPreferences = {semanticMemoryEnabled: false};
+	writeFileSync(preferencesPath, JSON.stringify(preferences), 'utf-8');
+
+	try {
+		const result = getSemanticMemoryEnabled();
+		t.is(result, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateSemanticMemoryEnabled saves the preference correctly', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateSemanticMemoryEnabled(false);
+
+		t.true(existsSync(preferencesPath));
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.semanticMemoryEnabled, false);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Project Context Preferences Tests (token budget + memory limit, round-4 review)
+// ============================================================================
+
+test('resolveProjectContextPreferences falls back to the shipped defaults', t => {
+	t.deepEqual(resolveProjectContextPreferences({} as UserPreferences), {
+		semanticMemoryEnabled: true,
+		memoryLimit: DEFAULT_MEMORY_LIMIT,
+		tokenBudget: DEFAULT_TOKEN_BUDGET,
+	});
+});
+
+test('resolveProjectContextPreferences honours configured values', t => {
+	t.deepEqual(
+		resolveProjectContextPreferences({
+			semanticMemoryEnabled: false,
+			semanticMemoryLimit: 3,
+			semanticMemoryTokenBudget: 120,
+		} as UserPreferences),
+		{semanticMemoryEnabled: false, memoryLimit: 3, tokenBudget: 120},
+	);
+});
+
+test('resolveProjectContextPreferences clamps out-of-range values', t => {
+	const tooLow = resolveProjectContextPreferences({
+		semanticMemoryLimit: 0,
+		semanticMemoryTokenBudget: 1,
+	} as UserPreferences);
+	t.is(tooLow.memoryLimit, MIN_MEMORY_LIMIT);
+	t.is(tooLow.tokenBudget, MIN_TOKEN_BUDGET);
+
+	const tooHigh = resolveProjectContextPreferences({
+		semanticMemoryLimit: 10_000,
+		semanticMemoryTokenBudget: 10_000,
+	} as UserPreferences);
+	t.is(tooHigh.memoryLimit, MAX_MEMORY_LIMIT);
+	t.is(tooHigh.tokenBudget, MAX_TOKEN_BUDGET);
+});
+
+test.serial('getProjectContextPreferences reads token budget and memory limit from disk', t => {
+	const preferencesPath = getTestPreferencesPath();
+	const data: UserPreferences = {
+		semanticMemoryEnabled: true,
+		semanticMemoryLimit: 12,
+		semanticMemoryTokenBudget: 480,
+	};
+	writeFileSync(preferencesPath, JSON.stringify(data, null, 2), 'utf-8');
+
+	try {
+		t.deepEqual(getProjectContextPreferences(), {
+			semanticMemoryEnabled: true,
+			memoryLimit: 12,
+			tokenBudget: 480,
+		});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateSemanticMemoryLimit saves a clamped value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateSemanticMemoryLimit(500);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.semanticMemoryLimit, MAX_MEMORY_LIMIT);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('updateSemanticMemoryTokenBudget saves a clamped value', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateSemanticMemoryTokenBudget(1);
+
+		const content = readFileSync(preferencesPath, 'utf-8');
+		const parsed = JSON.parse(content) as UserPreferences;
+
+		t.is(parsed.semanticMemoryTokenBudget, MIN_TOKEN_BUDGET);
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+test.serial('full workflow: update and retrieve project context preferences', t => {
+	const preferencesPath = getTestPreferencesPath();
+	if (existsSync(preferencesPath)) {
+		rmSync(preferencesPath, {force: true});
+	}
+
+	try {
+		updateSemanticMemoryLimit(5);
+		updateSemanticMemoryTokenBudget(960);
+
+		t.deepEqual(getProjectContextPreferences(), {
+			semanticMemoryEnabled: true,
+			memoryLimit: 5,
+			tokenBudget: 960,
+		});
+	} finally {
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+	}
+});
+
+// ============================================================================
+// Directory Trust Tests — shared by the interactive TUI, --plain, and the
+// daemon boot path (see source/daemon/cli.ts's `start`).
+// ============================================================================
+
+test('isDirectoryTrusted returns false when trustedDirectories is empty', t => {
+	t.false(isDirectoryTrusted('/some/project', {}));
+});
+
+test('isDirectoryTrusted matches a record with the current fingerprint', t => {
+	const dir = process.cwd();
+	const fingerprint = describeProjectTrust(dir).fingerprint;
+	t.true(
+		isDirectoryTrusted(dir, {
+			trustedDirectories: [{path: dir, fingerprint}],
+		}),
+	);
+	t.true(
+		isDirectoryTrusted(dir, {
+			trustedDirectories: [{path: '.', fingerprint}],
+		}),
+	);
+});
+
+test('isDirectoryTrusted ignores a path that has no fingerprint', t => {
+	const dir = process.cwd();
+	t.false(isDirectoryTrusted(dir, {trustedDirectories: [dir]}));
+});
+
+test('isDirectoryTrusted ignores a stale fingerprint', t => {
+	const dir = process.cwd();
+	t.false(
+		isDirectoryTrusted(dir, {
+			trustedDirectories: [{path: dir, fingerprint: 'stale'}],
+		}),
+	);
+});
+
+test('isDirectoryTrusted is false after a plugin is added', t => {
+	const root = join(tmpdir(), `trust-plugin-${Date.now()}`);
+	mkdirSync(join(root, '.nanocoder', 'plugins'), {recursive: true});
+	try {
+		const before = describeProjectTrust(root).fingerprint;
+		writeFileSync(
+			join(root, '.nanocoder', 'plugins', 'pulled.mjs'),
+			'export default {name:"pulled"}\n',
+		);
+		t.false(
+			isDirectoryTrusted(root, {
+				trustedDirectories: [{path: root, fingerprint: before}],
+			}),
+		);
+		t.true(
+			isDirectoryTrusted(root, {
+				trustedDirectories: [
+					{
+						path: root,
+						fingerprint: describeProjectTrust(root).fingerprint,
+					},
+				],
+			}),
+		);
+	} finally {
+		rmSync(root, {recursive: true, force: true});
+	}
+});
+
+test('isDirectoryTrusted does not match an unrelated directory', t => {
+	t.false(
+		isDirectoryTrusted(process.cwd(), {
+			trustedDirectories: ['/some/other/project'],
+		}),
+	);
+});
+
+test('ensureDirectoryTrust trusts without persisting when bypass is true', t => {
+	let saveCalled = false;
+	const result = ensureDirectoryTrust('/untrusted/project', true, {
+		loadPreferences: () => ({trustedDirectories: []}),
+		savePreferences: () => {
+			saveCalled = true;
+		},
+	});
+	t.deepEqual(result, {trusted: true, persisted: false});
+	t.false(saveCalled);
+});
+
+test('ensureDirectoryTrust trusts an already-recorded directory without persisting again', t => {
+	const dir = process.cwd();
+	let saveCalled = false;
+	const result = ensureDirectoryTrust(dir, false, {
+		loadPreferences: () => ({
+			trustedDirectories: [
+				{path: dir, fingerprint: describeProjectTrust(dir).fingerprint},
+			],
+		}),
+		savePreferences: () => {
+			saveCalled = true;
+		},
+	});
+	t.deepEqual(result, {trusted: true, persisted: false});
+	t.false(saveCalled);
+});
+
+test.serial(
+	'ensureDirectoryTrust refuses an unrecorded directory when NANOCODER_TRUST_DIRECTORY is unset',
+	t => {
+		delete process.env.NANOCODER_TRUST_DIRECTORY;
+		const result = ensureDirectoryTrust('/untrusted/project', false, {
+			loadPreferences: () => ({trustedDirectories: []}),
+			savePreferences: () => {
+				t.fail('should not persist when refusing');
+			},
+		});
+		t.deepEqual(result, {trusted: false, persisted: false, recheck: null});
+	},
+);
+
+test.serial(
+	'ensureDirectoryTrust flags a trusted directory whose fingerprint changed',
+	t => {
+		delete process.env.NANOCODER_TRUST_DIRECTORY;
+		const dir = process.cwd();
+		const result = ensureDirectoryTrust(dir, false, {
+			loadPreferences: () => ({
+				trustedDirectories: [{path: dir, fingerprint: 'old'}],
+			}),
+			savePreferences: () => {
+				t.fail('should not persist when refusing');
+			},
+		});
+		t.deepEqual(result, {trusted: false, persisted: false, recheck: 'changed'});
+	},
+);
+
+test.serial(
+	'ensureDirectoryTrust says a path-only entry needs re-approval after the upgrade',
+	t => {
+		delete process.env.NANOCODER_TRUST_DIRECTORY;
+		const dir = process.cwd();
+		const result = ensureDirectoryTrust(dir, false, {
+			loadPreferences: () => ({trustedDirectories: [dir]}),
+			savePreferences: () => {
+				t.fail('should not persist when refusing');
+			},
+		});
+		t.deepEqual(result, {trusted: false, persisted: false, recheck: 'upgrade'});
+	},
+);
+
+test.serial('directoryTrustRefusal returns the refusal message for an untrusted directory', t => {
+	delete process.env.NANOCODER_TRUST_DIRECTORY;
+	const message = directoryTrustRefusal('/untrusted/project', false, {
+		loadPreferences: () => ({trustedDirectories: []}),
+		savePreferences: () => {
+			t.fail('should not persist when refusing');
+		},
+	});
+	t.regex(message ?? '', /is not trusted/);
+	t.regex(message ?? '', /--trust-directory/);
+	t.regex(message ?? '', /NANOCODER_TRUST_DIRECTORY=1/);
+});
+
+test.serial('directoryTrustRefusal words a path-only entry as needing re-approval after the upgrade', t => {
+	delete process.env.NANOCODER_TRUST_DIRECTORY;
+	const dir = process.cwd();
+	const message = directoryTrustRefusal(dir, false, {
+		loadPreferences: () => ({trustedDirectories: [dir]}),
+		savePreferences: () => {
+			t.fail('should not persist when refusing');
+		},
+	});
+	t.regex(message ?? '', /needs re-approval after the upgrade/);
+});
+
+test.serial('directoryTrustRefusal words a changed fingerprint differently from an unknown directory', t => {
+	delete process.env.NANOCODER_TRUST_DIRECTORY;
+	const dir = process.cwd();
+	const message = directoryTrustRefusal(dir, false, {
+		loadPreferences: () => ({
+			trustedDirectories: [{path: dir, fingerprint: 'old'}],
+		}),
+		savePreferences: () => {
+			t.fail('should not persist when refusing');
+		},
+	});
+	t.regex(message ?? '', /changed since you trusted it/);
+	t.notRegex(message ?? '', /is not trusted/);
+});
+
+test('a trust record without a version counts as version 1, and grants record one', t => {
+	const dir = process.cwd();
+	const fingerprint = describeProjectTrust(dir).fingerprint;
+	t.true(
+		isDirectoryTrusted(dir, {
+			trustedDirectories: [{path: dir, fingerprint}],
+		}),
+	);
+	t.like(grantDirectoryTrust({}, dir).trustedDirectories?.[0], {
+		fingerprintVersion: TRUST_FINGERPRINT_VERSION,
+	});
+});
+
+test('a trust record from another fingerprint version needs re-approval', t => {
+	const dir = process.cwd();
+	const preferences = {
+		trustedDirectories: [
+			{
+				path: dir,
+				fingerprint: describeProjectTrust(dir).fingerprint,
+				fingerprintVersion: TRUST_FINGERPRINT_VERSION + 1,
+			},
+		],
+	};
+	t.false(isDirectoryTrusted(dir, preferences));
+	t.is(trustRecheck(dir, preferences), 'upgrade');
+	t.is(
+		trustRecheck(dir, {
+			trustedDirectories: [{path: dir, fingerprint: 'stale'}],
+		}),
+		'changed',
+	);
+});
+
+test('directoryTrustRefusal is null when bypassed or already trusted', t => {
+	const deps = {
+		loadPreferences: () => ({trustedDirectories: []}),
+		savePreferences: () => {
+			t.fail('should not persist');
+		},
+	};
+	t.is(directoryTrustRefusal('/untrusted/project', true, deps), null);
+
+	const dir = process.cwd();
+	t.is(
+		directoryTrustRefusal(dir, false, {
+			...deps,
+			loadPreferences: () => ({
+				trustedDirectories: [
+					{path: dir, fingerprint: describeProjectTrust(dir).fingerprint},
+				],
+			}),
+		}),
+		null,
+	);
+});
+
+test('trust checks skip malformed entries instead of throwing', t => {
+	const dir = process.cwd();
+	const preferences = {
+		trustedDirectories: [null, {}, {path: 5}, 7],
+	} as unknown as UserPreferences;
+	t.false(isDirectoryTrusted(dir, preferences));
+	t.is(trustRecheck(dir, preferences), null);
+	const granted = grantDirectoryTrust(preferences, dir);
+	t.true(isDirectoryTrusted(dir, granted));
+});
+
+test.serial(
+	'ensureDirectoryTrust with NANOCODER_TRUST_DIRECTORY=1 trusts and persists a new entry',
+	t => {
+		process.env.NANOCODER_TRUST_DIRECTORY = '1';
+		let savedPreferences: UserPreferences | null = null;
+		try {
+			const target = join(tmpdir(), 'nanocoder-untrusted-project');
+			const result = ensureDirectoryTrust(target, false, {
+				loadPreferences: () => ({trustedDirectories: []}),
+				savePreferences: prefs => {
+					savedPreferences = prefs;
+				},
+			});
+			t.true(result.trusted);
+			t.true(result.persisted);
+			t.deepEqual(savedPreferences?.trustedDirectories, [
+				{
+					path: target,
+					fingerprint: describeProjectTrust(target).fingerprint,
+					fingerprintVersion: TRUST_FINGERPRINT_VERSION,
+				},
+			]);
+		} finally {
+			delete process.env.NANOCODER_TRUST_DIRECTORY;
+		}
+	},
+);
+
+test.serial(
+	'ensureDirectoryTrust with NANOCODER_TRUST_DIRECTORY=1 does not duplicate an already-trusted directory',
+	t => {
+		process.env.NANOCODER_TRUST_DIRECTORY = '1';
+		try {
+			const dir = process.cwd();
+			let saveCalled = false;
+			const result = ensureDirectoryTrust(dir, false, {
+				loadPreferences: () => ({
+					trustedDirectories: [
+						{
+							path: dir,
+							fingerprint: describeProjectTrust(dir).fingerprint,
+						},
+					],
+				}),
+				savePreferences: () => {
+					saveCalled = true;
+				},
+			});
+			t.deepEqual(result, {trusted: true, persisted: false});
+			t.false(saveCalled);
+		} finally {
+			delete process.env.NANOCODER_TRUST_DIRECTORY;
+		}
+	},
+);
+
+test.serial(
+	'ensureDirectoryTrust with NANOCODER_TRUST_DIRECTORY=1 replaces a path-only entry',
+	t => {
+		process.env.NANOCODER_TRUST_DIRECTORY = '1';
+		let savedPreferences: UserPreferences | null = null;
+		try {
+			const dir = process.cwd();
+			const result = ensureDirectoryTrust(dir, false, {
+				loadPreferences: () => ({trustedDirectories: [dir]}),
+				savePreferences: prefs => {
+					savedPreferences = prefs;
+				},
+			});
+			t.true(result.trusted);
+			t.true(result.persisted);
+			t.deepEqual(savedPreferences?.trustedDirectories, [
+				{
+					path: dir,
+					fingerprint: describeProjectTrust(dir).fingerprint,
+					fingerprintVersion: TRUST_FINGERPRINT_VERSION,
+				},
+			]);
+		} finally {
+			delete process.env.NANOCODER_TRUST_DIRECTORY;
+		}
+	},
+);
+
+// ============================================================================
+// Trust is global-only: a project-level nanocoder-preferences.json (which
+// ships with a cloned repo) must never be able to mark its own directory
+// trusted, and trust writes must never land in it.
+// ============================================================================
+
+function withProjectPreferences(
+	projectPrefs: UserPreferences,
+	globalPrefs: UserPreferences | null,
+	run: (paths: {projectFile: string; globalFile: string}) => void,
+): void {
+	const root = join(tmpdir(), `nanocoder-trust-${Date.now()}-${Math.random()}`);
+	const home = join(root, 'home');
+	const project = join(root, 'project');
+	mkdirSync(project, {recursive: true});
+	const saved = {
+		configDir: process.env.NANOCODER_CONFIG_DIR,
+		home: process.env.HOME,
+		xdg: process.env.XDG_CONFIG_HOME,
+		appData: process.env.APPDATA,
+		cwd: process.cwd(),
+	};
+	try {
+		delete process.env.NANOCODER_CONFIG_DIR;
+		process.env.HOME = home;
+		process.env.XDG_CONFIG_HOME = join(home, '.config');
+		process.env.APPDATA = join(home, 'AppData');
+		const globalDir =
+			process.platform === 'darwin'
+				? join(home, 'Library', 'Preferences', 'nanocoder')
+				: process.platform === 'win32'
+					? join(home, 'AppData', 'nanocoder')
+					: join(home, '.config', 'nanocoder');
+		mkdirSync(globalDir, {recursive: true});
+		const globalFile = join(globalDir, 'nanocoder-preferences.json');
+		if (globalPrefs) writeFileSync(globalFile, JSON.stringify(globalPrefs));
+		const projectFile = join(project, 'nanocoder-preferences.json');
+		writeFileSync(projectFile, JSON.stringify(projectPrefs));
+		process.chdir(project);
+		resetPreferencesCache();
+		run({projectFile, globalFile});
+	} finally {
+		process.chdir(saved.cwd);
+		process.env.NANOCODER_CONFIG_DIR = saved.configDir;
+		if (saved.home === undefined) delete process.env.HOME;
+		else process.env.HOME = saved.home;
+		if (saved.xdg === undefined) delete process.env.XDG_CONFIG_HOME;
+		else process.env.XDG_CONFIG_HOME = saved.xdg;
+		if (saved.appData === undefined) delete process.env.APPDATA;
+		else process.env.APPDATA = saved.appData;
+		resetPreferencesCache();
+		rmSync(root, {recursive: true, force: true});
+	}
+}
+
+test.serial(
+	'loadPreferences ignores trustedDirectories from a project-level preferences file',
+	t => {
+		withProjectPreferences(
+			{trustedDirectories: ['.'], selectedTheme: 'tokyo-night' as never},
+			null,
+			() => {
+				const prefs = loadPreferences();
+				t.is(prefs.trustedDirectories, undefined);
+				t.is(prefs.selectedTheme, 'tokyo-night' as never);
+				t.false(isDirectoryTrusted(process.cwd(), prefs));
+			},
+		);
+	},
+);
+
+test.serial(
+	'loadPreferences takes trustedDirectories from the global file when a project file exists',
+	t => {
+		withProjectPreferences(
+			{trustedDirectories: ['/evil']},
+			{trustedDirectories: ['/trusted/by/user']},
+			() => {
+				t.deepEqual(loadPreferences().trustedDirectories, ['/trusted/by/user']);
+			},
+		);
+	},
+);
+
+test.serial(
+	'savePreferences writes trustedDirectories to the global file, never the project file',
+	t => {
+		withProjectPreferences({}, {lastModel: 'kept'}, ({projectFile, globalFile}) => {
+			const prefs = loadPreferences();
+			prefs.trustedDirectories = ['/newly/trusted'];
+			prefs.lastProvider = 'ollama';
+			savePreferences(prefs);
+
+			const project = JSON.parse(readFileSync(projectFile, 'utf-8'));
+			const global = JSON.parse(readFileSync(globalFile, 'utf-8'));
+			t.is(project.trustedDirectories, undefined);
+			t.is(project.lastProvider, 'ollama');
+			t.deepEqual(global.trustedDirectories, ['/newly/trusted']);
+			t.is(global.lastModel, 'kept');
+		});
+	},
+);
+
+test.serial(
+	'loadPreferences ignores fullCommitConfirmedProjects and ciWatch from a project-level preferences file',
+	t => {
+		withProjectPreferences(
+			{
+				fullCommitConfirmedProjects: ['/evil'],
+				ciWatch: {enabled: true},
+			},
+			null,
+			() => {
+				const prefs = loadPreferences();
+				t.is(prefs.fullCommitConfirmedProjects, undefined);
+				t.is(prefs.ciWatch, undefined);
+			},
+		);
+	},
+);
+
+test.serial(
+	'loadPreferences takes fullCommitConfirmedProjects and ciWatch from the global file',
+	t => {
+		withProjectPreferences(
+			{fullCommitConfirmedProjects: ['/evil'], ciWatch: {enabled: false}},
+			{fullCommitConfirmedProjects: ['/mine'], ciWatch: {enabled: true}},
+			() => {
+				const prefs = loadPreferences();
+				t.deepEqual(prefs.fullCommitConfirmedProjects, ['/mine']);
+				t.true(prefs.ciWatch?.enabled);
+			},
+		);
+	},
+);
+
+test.serial(
+	'savePreferences writes fullCommitConfirmedProjects to the global file, never the project file',
+	t => {
+		withProjectPreferences({}, {lastModel: 'kept'}, ({projectFile, globalFile}) => {
+			const prefs = loadPreferences();
+			prefs.fullCommitConfirmedProjects = ['/confirmed'];
+			savePreferences(prefs);
+
+			const project = JSON.parse(readFileSync(projectFile, 'utf-8'));
+			const global = JSON.parse(readFileSync(globalFile, 'utf-8'));
+			t.is(project.fullCommitConfirmedProjects, undefined);
+			t.deepEqual(global.fullCommitConfirmedProjects, ['/confirmed']);
+			t.is(global.lastModel, 'kept');
+		});
+	},
+);
+
+// ============================================================================
+// maxFps (TUI Frame Rate Limit) Tests
+// ============================================================================
+
+test('maxFps constants have expected values', t => {
+	t.is(DEFAULT_MAX_FPS, 30);
+	t.is(MIN_MAX_FPS, 1);
+	t.is(MAX_MAX_FPS, 60);
+});
+
+test('isValidMaxFps accepts valid integers between 1 and 60', t => {
+	t.true(isValidMaxFps(1));
+	t.true(isValidMaxFps(15));
+	t.true(isValidMaxFps(30));
+	t.true(isValidMaxFps(45));
+	t.true(isValidMaxFps(60));
+});
+
+test('isValidMaxFps rejects out-of-range numbers', t => {
+	t.false(isValidMaxFps(0));
+	t.false(isValidMaxFps(-1));
+	t.false(isValidMaxFps(-30));
+	t.false(isValidMaxFps(61));
+	t.false(isValidMaxFps(100));
+});
+
+test('isValidMaxFps rejects non-integer numbers', t => {
+	t.false(isValidMaxFps(0.5));
+	t.false(isValidMaxFps(15.5));
+	t.false(isValidMaxFps(30.1));
+	t.false(isValidMaxFps(59.9));
+	t.false(isValidMaxFps(NaN));
+	t.false(isValidMaxFps(Number.POSITIVE_INFINITY));
+	t.false(isValidMaxFps(Number.NEGATIVE_INFINITY));
+});
+
+test('isValidMaxFps rejects non-number types', t => {
+	t.false(isValidMaxFps('30'));
+	t.false(isValidMaxFps(''));
+	t.false(isValidMaxFps(null));
+	t.false(isValidMaxFps(undefined));
+	t.false(isValidMaxFps(true));
+	t.false(isValidMaxFps(false));
+	t.false(isValidMaxFps({}));
+	t.false(isValidMaxFps([]));
+});
+
+test.serial(
+	'getMaxFps returns DEFAULT_MAX_FPS (30) when preference is not configured',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		writeFileSync(
+			preferencesPath,
+			JSON.stringify({lastProvider: 'test'}),
+			'utf-8',
+		);
+
+		try {
+			t.is(getMaxFps(), 30);
+			t.is(getUiMaxFps(), undefined);
+		} finally {
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial(
+	'getMaxFps returns DEFAULT_MAX_FPS (30) when file does not exist',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		if (existsSync(preferencesPath)) {
+			rmSync(preferencesPath, {force: true});
+		}
+
+		t.is(getMaxFps(), 30);
+		t.is(getUiMaxFps(), undefined);
+	},
+);
+
+test.serial(
+	'getMaxFps returns valid configured value from nanocoder.ui.maxFps',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		const prefs: UserPreferences = {
+			nanocoder: {
+				ui: {
+					maxFps: 15,
+				},
+			},
+		};
+		writeFileSync(preferencesPath, JSON.stringify(prefs, null, 2), 'utf-8');
+
+		try {
+			t.is(getMaxFps(), 15);
+			t.is(getUiMaxFps(), 15);
+		} finally {
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial(
+	'getMaxFps rejects invalid values and falls back to default 30',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		const invalidCases = [0, -5, 61, 100, 15.5, '15', null, true, {}];
+
+		try {
+			for (const invalid of invalidCases) {
+				writeFileSync(
+					preferencesPath,
+					JSON.stringify({nanocoder: {ui: {maxFps: invalid}}}, null, 2),
+					'utf-8',
+				);
+				t.is(
+					getMaxFps(),
+					30,
+					`Expected default 30 for invalid value: ${JSON.stringify(invalid)}`,
+				);
+				t.is(
+					getUiMaxFps(),
+					undefined,
+					`Expected undefined for invalid value: ${JSON.stringify(invalid)}`,
+				);
+			}
+		} finally {
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial(
+	'updatePreferencesNestedValue writes ui.maxFps properly and preserves existing preferences',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		const initialPrefs: UserPreferences = {
+			lastProvider: 'test-provider',
+			nanocoder: {
+				paste: {singleLineThreshold: 500},
+			},
+		};
+		writeFileSync(
+			preferencesPath,
+			JSON.stringify(initialPrefs, null, 2),
+			'utf-8',
+		);
+
+		try {
+			updatePreferencesNestedValue('ui', 'maxFps', 24);
+
+			const data = JSON.parse(
+				readFileSync(preferencesPath, 'utf-8'),
+			) as UserPreferences;
+			t.is(data.nanocoder?.ui?.maxFps, 24);
+			t.is(data.lastProvider, 'test-provider');
+			t.is(data.nanocoder?.paste?.singleLineThreshold, 500);
+			t.is(getMaxFps(), 24);
+			t.is(getUiMaxFps(), 24);
+		} finally {
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial(
+	'updatePreferencesNestedValue invalidates cached preferences and notifies subscribers',
+	t => {
+		const preferencesPath = getTestPreferencesPath();
+		let notifications = 0;
+		let unsubscribe: (() => void) | undefined;
+
+		try {
+			t.true(
+				savePreferences({
+					nanocoder: {ui: {maxFps: 30}},
+				}),
+			);
+			t.is(loadPreferences().nanocoder?.ui?.maxFps, 30);
+			t.is(getMaxFps(), 30);
+
+			const previousVersion = getPreferencesVersion();
+			unsubscribe = subscribeToPreferences(() => {
+				notifications++;
+			});
+
+			updatePreferencesNestedValue('ui', 'maxFps', 24);
+
+			t.is(getPreferencesVersion(), previousVersion + 1);
+			t.is(notifications, 1);
+			t.is(loadPreferences().nanocoder?.ui?.maxFps, 24);
+			t.is(getMaxFps(), 24);
+			t.is(notifications, 1);
+		} finally {
+			unsubscribe?.();
+			if (existsSync(preferencesPath)) {
+				rmSync(preferencesPath, {force: true});
+			}
+		}
+	},
+);
+
+test.serial(
+	'writeConfigFileAtomic invalidates preferences once after a successful preferences write',
+	t => {
+		const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-writer-cache-'));
+		const previousDir = process.env.NANOCODER_CONFIG_DIR;
+		const file = path.join(dir, 'nanocoder-preferences.json');
+		let notifications = 0;
+		let unsubscribe: (() => void) | undefined;
+
+		try {
+			process.env.NANOCODER_CONFIG_DIR = dir;
+			resetPreferencesCache();
+
+			t.true(savePreferences({showAgentBashOutput: false}));
+			t.false(getShowAgentBashOutput());
+
+			const previousVersion = getPreferencesVersion();
+			unsubscribe = subscribeToPreferences(() => {
+				notifications++;
+			});
+
+			writeConfigFileAtomic(file, {showAgentBashOutput: true});
+
+			t.is(getPreferencesVersion(), previousVersion + 1);
+			t.is(notifications, 1);
+			t.true(loadPreferences().showAgentBashOutput);
+			t.true(getShowAgentBashOutput());
+
+			const versionAfterWrite = getPreferencesVersion();
+
+			const blockingFile = path.join(dir, 'blocking-file');
+			writeFileSync(blockingFile, 'not a directory');
+
+			t.throws(() =>
+				writeConfigFileAtomic(
+					path.join(blockingFile, 'nanocoder-preferences.json'),
+					{showAgentBashOutput: false},
+				),
+			);
+			t.is(getPreferencesVersion(), versionAfterWrite);
+			t.is(notifications, 1);
+			t.true(getShowAgentBashOutput());
+		} finally {
+			unsubscribe?.();
+			if (previousDir === undefined) {
+				delete process.env.NANOCODER_CONFIG_DIR;
+			} else {
+				process.env.NANOCODER_CONFIG_DIR = previousDir;
+			}
+
+			resetPreferencesCache();
+			rmSync(dir, {recursive: true, force: true});
+		}
+	},
+);
+
+
+test.serial('loadPreferences returns cached data when file is unchanged', t => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-cache-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+
+	try {
+		process.env.NANOCODER_CONFIG_DIR = dir;
+		const file = path.join(dir, 'nanocoder-preferences.json');
+
+		writeFileSync(file, JSON.stringify({selectedTheme: 'dark'}));
+		resetPreferencesCache();
+
+		const first = loadPreferences();
+		const second = loadPreferences();
+
+		t.deepEqual(first, second);
+		t.not(first, second);
+
+		// Callers must not be able to modify the cached object.
+		first.selectedTheme = 'light';
+
+		t.is(loadPreferences().selectedTheme, 'dark');
+	} finally {
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('savePreferences invalidates the cache immediately', t => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-cache-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+
+	try {
+		process.env.NANOCODER_CONFIG_DIR = dir;
+		const file = path.join(dir, 'nanocoder-preferences.json');
+
+		writeFileSync(file, JSON.stringify({reasoningExpanded: false}));
+		resetPreferencesCache();
+
+		t.false(loadPreferences().reasoningExpanded);
+
+		const saved = savePreferences({reasoningExpanded: true});
+		t.true(saved);
+
+		// No delay: an in-process save must invalidate immediately.
+		t.true(loadPreferences().reasoningExpanded);
+	} finally {
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('loadPreferences detects external file modifications', async t => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-cache-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+
+	try {
+		process.env.NANOCODER_CONFIG_DIR = dir;
+		const file = path.join(dir, 'nanocoder-preferences.json');
+
+		writeFileSync(file, JSON.stringify({reasoningExpanded: false}));
+		resetPreferencesCache();
+
+		t.false(loadPreferences().reasoningExpanded);
+
+		// Simulate another process modifying the preferences file.
+		writeFileSync(file, JSON.stringify({reasoningExpanded: true}));
+
+		const changedTime = new Date(Date.now() + 60_000);
+		utimesSync(file, changedTime, changedTime);
+
+		// Cached data remains valid during the metadata-check interval.
+		t.false(loadPreferences().reasoningExpanded);
+
+		// Allow the one-second interval to expire.
+		await new Promise(resolve => setTimeout(resolve, 1100));
+
+		t.true(loadPreferences().reasoningExpanded);
+	} finally {
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('loadPreferences respects config directory changes', t => {
+	const firstDir = mkdtempSync(path.join(tmpdir(), 'nanocoder-first-'));
+	const secondDir = mkdtempSync(path.join(tmpdir(), 'nanocoder-second-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+
+	try {
+		writeFileSync(
+			path.join(firstDir, 'nanocoder-preferences.json'),
+			JSON.stringify({reasoningExpanded: false}),
+		);
+
+		writeFileSync(
+			path.join(secondDir, 'nanocoder-preferences.json'),
+			JSON.stringify({reasoningExpanded: true}),
+		);
+
+		process.env.NANOCODER_CONFIG_DIR = firstDir;
+		resetPreferencesCache();
+
+		t.false(loadPreferences().reasoningExpanded);
+
+		// Path changes must invalidate immediately, even within one second.
+		process.env.NANOCODER_CONFIG_DIR = secondDir;
+
+		t.true(loadPreferences().reasoningExpanded);
+	} finally {
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(firstDir, {recursive: true, force: true});
+		rmSync(secondDir, {recursive: true, force: true});
+	}
+});
+
+test.serial('loadPreferences avoids repeated filesystem reads and stats', t => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-reads-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+	const preferencesFile = path.join(dir, 'nanocoder-preferences.json');
+
+	const originalReadFileSync = fs.readFileSync;
+	const originalStatSync = fs.statSync;
+
+	let reads = 0;
+	let stats = 0;
+
+	const isPreferencesFile = (file: unknown): boolean => {
+		return (
+			typeof file === 'string' &&
+			path.resolve(file) === path.resolve(preferencesFile)
+		);
+	};
+
+	try {
+		writeFileSync(
+			preferencesFile,
+			JSON.stringify({reasoningExpanded: false}),
+		);
+
+		process.env.NANOCODER_CONFIG_DIR = dir;
+		resetPreferencesCache();
+
+		fs.readFileSync = ((
+			file: Parameters<typeof fs.readFileSync>[0],
+			...args: unknown[]
+		) => {
+			if (isPreferencesFile(file)) {
+				reads++;
+			}
+
+			return Reflect.apply(originalReadFileSync, fs, [file, ...args]);
+		}) as typeof fs.readFileSync;
+
+		fs.statSync = ((
+			file: Parameters<typeof fs.statSync>[0],
+			...args: unknown[]
+		) => {
+			if (isPreferencesFile(file)) {
+				stats++;
+			}
+
+			return Reflect.apply(originalStatSync, fs, [file, ...args]);
+		}) as typeof fs.statSync;
+
+		syncBuiltinESMExports();
+
+		// First load reads the preferences file.
+		loadPreferences();
+
+		t.is(reads, 1);
+
+		const initialStats = stats;
+
+		// Hot-path calls should require neither reads nor stats.
+		for (let i = 0; i < 10; i++) {
+			loadPreferences();
+		}
+
+		t.is(reads, 1);
+		t.is(stats, initialStats);
+
+		// Successful saves invalidate the cache immediately.
+		t.true(savePreferences({reasoningExpanded: true}));
+
+		loadPreferences();
+
+		t.is(reads, 2);
+
+		const statsAfterSave = stats;
+
+		for (let i = 0; i < 10; i++) {
+			loadPreferences();
+		}
+
+		t.is(reads, 2);
+		t.is(stats, statsAfterSave);
+	} finally {
+		fs.readFileSync = originalReadFileSync;
+		fs.statSync = originalStatSync;
+		syncBuiltinESMExports();
+
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('cached preference getter refreshes after save', t => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-derived-cache-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+
+	try {
+		process.env.NANOCODER_CONFIG_DIR = dir;
+
+		const file = path.join(dir, 'nanocoder-preferences.json');
+
+		writeFileSync(
+			file,
+			JSON.stringify({showAgentBashOutput: false}),
+		);
+
+		resetPreferencesCache();
+
+		t.false(getShowAgentBashOutput());
+
+		t.true(savePreferences({showAgentBashOutput: true}));
+
+		// The preferences version changes after a successful save.
+		t.true(getShowAgentBashOutput());
+
+		// Repeated calls reuse the derived value.
+		t.true(getShowAgentBashOutput());
+	} finally {
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('cached preference getter stays on the filesystem-free hot path', t => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'nanocoder-derived-fast-'));
+	const previousDir = process.env.NANOCODER_CONFIG_DIR;
+
+	const originalReadFileSync = fs.readFileSync;
+	const originalStatSync = fs.statSync;
+
+	let reads = 0;
+	let stats = 0;
+
+	try {
+		process.env.NANOCODER_CONFIG_DIR = dir;
+
+		const file = path.join(dir, 'nanocoder-preferences.json');
+
+		writeFileSync(
+			file,
+			JSON.stringify({showAgentBashOutput: true}),
+		);
+
+		resetPreferencesCache();
+
+		// Populate the version-based derived cache first.
+		t.true(getShowAgentBashOutput());
+
+		fs.readFileSync = ((
+			filePath: Parameters<typeof fs.readFileSync>[0],
+			...args: unknown[]
+		) => {
+			reads++;
+			return Reflect.apply(originalReadFileSync, fs, [
+				filePath,
+				...args,
+			]);
+		}) as typeof fs.readFileSync;
+
+		fs.statSync = ((
+			filePath: Parameters<typeof fs.statSync>[0],
+			...args: unknown[]
+		) => {
+			stats++;
+			return Reflect.apply(originalStatSync, fs, [
+				filePath,
+				...args,
+			]);
+		}) as typeof fs.statSync;
+
+		syncBuiltinESMExports();
+
+		for (let i = 0; i < 1000; i++) {
+			t.true(getShowAgentBashOutput());
+		}
+
+		t.is(reads, 0);
+		t.is(stats, 0);
+	} finally {
+		fs.readFileSync = originalReadFileSync;
+		fs.statSync = originalStatSync;
+		syncBuiltinESMExports();
+
+		if (previousDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousDir;
+		}
+
+		resetPreferencesCache();
+		rmSync(dir, {recursive: true, force: true});
+	}
+});

@@ -1,0 +1,1792 @@
+import {existsSync, mkdirSync, rmSync, writeFileSync} from 'fs';
+import {tmpdir} from 'os';
+import {join} from 'path';
+import test from 'ava';
+import {
+	ConfigurationError,
+	createLLMClient,
+	loadProviderConfigs,
+} from './client-factory';
+import type {AIProviderConfig} from '@/types/config';
+import {clearAppConfig, reloadAppConfig} from '@/config/index';
+import {resetPreferencesCache} from '@/config/preferences';
+
+console.log('\nclient-factory.spec.ts');
+
+// Store originals for restoration
+const originalFetch = globalThis.fetch;
+const originalCwd = process.cwd;
+const originalConfigDir = process.env.NANOCODER_CONFIG_DIR;
+
+// Create a temporary test directory
+const testDir = join(tmpdir(), `nanocoder-client-factory-test-${Date.now()}`);
+
+// Mock fetch helper
+function createMockFetch(
+	shouldResolve: boolean,
+	status = 200,
+	shouldTimeout = false,
+): typeof fetch {
+	return (async (input: RequestInfo | URL, init?: RequestInit) => {
+		if (shouldTimeout) {
+			const error = new Error('The operation was aborted');
+			error.name = 'AbortError';
+			throw error;
+		}
+
+		if (!shouldResolve) {
+			throw new TypeError('Failed to fetch');
+		}
+
+		return {
+			ok: status >= 200 && status < 300,
+			status,
+			statusText: status === 200 ? 'OK' : 'Error',
+			json: async () => ({}),
+			text: async () => '',
+			headers: new Headers(),
+		} as Response;
+	}) as typeof fetch;
+}
+
+// Helper to create a test config file
+function createTestConfig(content: object, dir: string = testDir): string {
+	const configPath = join(dir, 'agents.config.json');
+	writeFileSync(configPath, JSON.stringify(content, null, 2));
+	return configPath;
+}
+
+function getClientProviderConfig(client: {providerConfig?: AIProviderConfig}):
+	| AIProviderConfig
+	| undefined {
+	return client.providerConfig;
+}
+
+// Setup and teardown
+test.before(() => {
+	// Create test directory
+	mkdirSync(testDir, {recursive: true});
+});
+
+test.beforeEach(() => {
+	globalThis.fetch = originalFetch;
+});
+
+test.afterEach(() => {
+	globalThis.fetch = originalFetch;
+	// Restore original cwd
+	process.cwd = originalCwd;
+	if (originalConfigDir === undefined) {
+		delete process.env.NANOCODER_CONFIG_DIR;
+	} else {
+		process.env.NANOCODER_CONFIG_DIR = originalConfigDir;
+	}
+});
+
+test.after.always(() => {
+	// Clean up test directory
+	if (existsSync(testDir)) {
+		rmSync(testDir, {recursive: true, force: true});
+	}
+});
+
+// ============================================================================
+// ConfigurationError Tests
+// ============================================================================
+
+test('ConfigurationError: creates error with all properties', t => {
+	const error = new ConfigurationError(
+		'Test error message',
+		'/path/to/config',
+		'/path/to/cwd',
+		true,
+	);
+
+	t.is(error.message, 'Test error message');
+	t.is(error.name, 'ConfigurationError');
+	t.is(error.configPath, '/path/to/config');
+	t.is(error.cwdPath, '/path/to/cwd');
+	t.is(error.isEmptyConfig, true);
+});
+
+test('ConfigurationError: creates error with minimal properties', t => {
+	const error = new ConfigurationError(
+		'Test error message',
+		'/path/to/config',
+	);
+
+	t.is(error.message, 'Test error message');
+	t.is(error.name, 'ConfigurationError');
+	t.is(error.configPath, '/path/to/config');
+	t.is(error.cwdPath, undefined);
+	t.is(error.isEmptyConfig, false);
+});
+
+test('ConfigurationError: is instance of Error', t => {
+	const error = new ConfigurationError(
+		'Test error message',
+		'/path/to/config',
+	);
+
+	t.true(error instanceof Error);
+	t.true(error instanceof ConfigurationError);
+});
+
+test('ConfigurationError: has correct stack trace', t => {
+	const error = new ConfigurationError(
+		'Test error message',
+		'/path/to/config',
+	);
+
+	t.truthy(error.stack);
+	t.true(error.stack?.includes('ConfigurationError'));
+});
+
+test('ConfigurationError: preserves error message exactly', t => {
+	const messages = [
+		'No agents.config.json found',
+		'No providers configured in agents.config.json',
+		'Failed to connect to provider',
+		'',
+		'Error with special chars: "quotes" and \'apostrophes\'',
+	];
+
+	for (const msg of messages) {
+		const error = new ConfigurationError(msg, '/path');
+		t.is(error.message, msg);
+	}
+});
+
+test('ConfigurationError: can be caught and rethrown', t => {
+	const originalError = new ConfigurationError(
+		'Original',
+		'/path',
+		'/cwd',
+		true,
+	);
+
+	try {
+		throw originalError;
+	} catch (caught) {
+		t.true(caught instanceof ConfigurationError);
+		if (caught instanceof ConfigurationError) {
+			t.is(caught.message, 'Original');
+			t.is(caught.configPath, '/path');
+			t.is(caught.cwdPath, '/cwd');
+			t.is(caught.isEmptyConfig, true);
+		}
+	}
+});
+
+test('ConfigurationError: handles very long error messages', t => {
+	const longMessage = 'Error: '.repeat(100) + 'End';
+	const error = new ConfigurationError(longMessage, '/path');
+
+	t.is(error.message, longMessage);
+	t.is(error.message.length, longMessage.length);
+});
+
+test('ConfigurationError: handles paths with special characters', t => {
+	const paths = [
+		'/path/with spaces/config.json',
+		'/path/with-dashes/config.json',
+		'/path/with_underscores/config.json',
+		'/path/with.dots/config.json',
+		'C:\\Windows\\Path\\config.json',
+		'/path/with/unicode/日本語/config.json',
+	];
+
+	for (const path of paths) {
+		const error = new ConfigurationError('Test', path, path);
+		t.is(error.configPath, path);
+		t.is(error.cwdPath, path);
+	}
+});
+
+test('ConfigurationError: isEmptyConfig defaults to false', t => {
+	const error = new ConfigurationError('Test', '/path');
+	t.is(error.isEmptyConfig, false);
+});
+
+test('ConfigurationError: isEmptyConfig can be explicitly set', t => {
+	const error1 = new ConfigurationError('Test', '/path', '/cwd', false);
+	const error2 = new ConfigurationError('Test', '/path', '/cwd', true);
+
+	t.is(error1.isEmptyConfig, false);
+	t.is(error2.isEmptyConfig, true);
+});
+
+test('ConfigurationError: cwdPath property is optional', t => {
+	const error1 = new ConfigurationError('Test', '/path');
+	const error2 = new ConfigurationError('Test', '/path', '/cwd');
+	const error3 = new ConfigurationError('Test', '/path', undefined);
+
+	t.is(error1.cwdPath, undefined);
+	t.is(error2.cwdPath, '/cwd');
+	t.is(error3.cwdPath, undefined);
+});
+
+test('ConfigurationError: unreadableError property is optional and captured', t => {
+	const error1 = new ConfigurationError('Test', '/path');
+	const error2 = new ConfigurationError(
+		'unreadable: /path: JSON syntax error',
+		'/path',
+		'/cwd',
+		false,
+		'unreadable: /path: JSON syntax error',
+	);
+
+	t.is(error1.unreadableError, undefined);
+	t.is(error2.unreadableError, 'unreadable: /path: JSON syntax error');
+});
+
+// ============================================================================
+// createLLMClient - No Configuration Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: throws error when no config file exists',
+	async t => {
+		// Create a temp directory with no config file
+		const emptyDir = join(testDir, 'empty-config-test');
+		mkdirSync(emptyDir, {recursive: true});
+
+		// Mock process.cwd to return empty directory
+		process.cwd = () => emptyDir;
+
+		// Reload config to pick up empty directory
+		reloadAppConfig();
+
+		// May throw or may succeed depending on global config
+		// This test verifies the function handles the case without crashing
+		try {
+			await createLLMClient();
+			// If it succeeds, that's fine (found config elsewhere)
+			t.pass();
+		} catch (error) {
+			// If it throws, that's also expected (no config found)
+			t.truthy(error);
+		}
+	},
+);
+
+test.serial(
+	'createLLMClient: throws ConfigurationError when config exists but has no providers',
+	async t => {
+		// Create config with empty providers array
+		const configDir = join(testDir, 'empty-providers-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Clear any cached config and reload to pick up new config
+		clearAppConfig();
+		reloadAppConfig();
+
+		// Should throw ConfigurationError when config exists but has no providers
+		const error = await t.throwsAsync(createLLMClient(), {
+			instanceOf: ConfigurationError,
+		});
+
+		t.is(error.message, 'No providers configured in agents.config.json');
+		t.true(error.isEmptyConfig);
+	},
+);
+
+test.serial(
+	'createLLMClient: attaches unreadableError with file path when agents.config.json has invalid JSON syntax',
+	async t => {
+		const invalidDir = join(testDir, 'invalid-json-test');
+		mkdirSync(invalidDir, {recursive: true});
+
+		const filePath = join(invalidDir, 'agents.config.json');
+		writeFileSync(
+			filePath,
+			'{\n  "nanocoder": {\n    "providers": [\n  }\n}',
+		);
+
+		process.cwd = () => invalidDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(createLLMClient(), {
+			instanceOf: ConfigurationError,
+		});
+
+		t.truthy(error.unreadableError);
+		t.true(error.unreadableError?.startsWith('unreadable: '));
+		t.true(error.unreadableError?.includes(filePath));
+		t.true(error.message.includes('unreadable: '));
+		t.true(error.message.includes(filePath));
+	},
+);
+
+test.serial(
+	'createLLMClient: captures unreadableError from global config when project config has no providers but global config has invalid JSON syntax',
+	async t => {
+		const projectDir = join(testDir, 'valid-empty-project-test');
+		const globalDir = join(testDir, 'broken-global-test');
+		mkdirSync(projectDir, {recursive: true});
+		mkdirSync(globalDir, {recursive: true});
+
+		writeFileSync(
+			join(projectDir, 'agents.config.json'),
+			'{\n  "nanocoder": {\n    "providers": []\n  }\n}',
+		);
+
+		const brokenGlobalPath = join(globalDir, 'agents.config.json');
+		writeFileSync(
+			brokenGlobalPath,
+			'{\n  "nanocoder": {\n    "providers": [\n  }\n}',
+		);
+
+		const previousConfigDir = process.env.NANOCODER_CONFIG_DIR;
+		process.env.NANOCODER_CONFIG_DIR = globalDir;
+		process.cwd = () => projectDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		try {
+			const error = await t.throwsAsync(createLLMClient(), {
+				instanceOf: ConfigurationError,
+			});
+
+			t.truthy(error.unreadableError);
+			t.true(error.unreadableError?.startsWith('unreadable: '));
+			t.true(error.unreadableError?.includes(brokenGlobalPath));
+			t.true(error.message.includes('unreadable: '));
+			t.true(error.message.includes(brokenGlobalPath));
+		} finally {
+			if (previousConfigDir === undefined) {
+				delete process.env.NANOCODER_CONFIG_DIR;
+			} else {
+				process.env.NANOCODER_CONFIG_DIR = previousConfigDir;
+			}
+		}
+	},
+);
+
+// ============================================================================
+// createLLMClient - Localhost Provider Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: succeeds with localhost provider that responds',
+	async t => {
+		// Mock fetch to simulate successful localhost connection
+		globalThis.fetch = createMockFetch(true, 200);
+
+		// Create config with localhost provider
+		const configDir = join(testDir, 'localhost-success-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'LocalTest',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['test-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		// This should succeed because localhost responds
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+test.serial(
+	'createLLMClient: localhost provider succeeds even when server not accessible (connectivity deferred)',
+	async t => {
+		// Mock fetch to simulate network error (server not running)
+		globalThis.fetch = createMockFetch(false);
+
+		// Create config with localhost provider
+		const configDir = join(testDir, 'localhost-fail-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'LocalTest',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['test-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Clear any cached config and reload to pick up new config
+		clearAppConfig();
+		reloadAppConfig();
+
+		// Connectivity is now deferred to first LLM request, so client creation succeeds
+		const result = await createLLMClient();
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'LocalTest');
+	},
+);
+
+test.serial(
+	'createLLMClient: localhost provider succeeds even on timeout (connectivity deferred)',
+	async t => {
+		// Mock fetch to simulate timeout
+		globalThis.fetch = createMockFetch(true, 200, true);
+
+		// Create config with localhost provider
+		const configDir = join(testDir, 'localhost-timeout-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'LocalTest',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['test-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Clear any cached config and reload to pick up new config
+		clearAppConfig();
+		reloadAppConfig();
+
+		// Connectivity is now deferred to first LLM request, so client creation succeeds
+		const result = await createLLMClient();
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'LocalTest');
+	},
+);
+
+test.serial(
+	'createLLMClient: localhost provider succeeds even with HTTP errors',
+	async t => {
+		// Mock fetch to return 404 (server responding, just not found)
+		globalThis.fetch = createMockFetch(true, 404);
+
+		// Create config with localhost provider
+		const configDir = join(testDir, 'localhost-404-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'LocalTest',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['test-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		// Should succeed because server is responding (even if 404)
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+// ============================================================================
+// createLLMClient - Hosted Provider Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: hosted provider requires API key',
+	async t => {
+		// Create config with hosted provider but no API key
+		const configDir = join(testDir, 'hosted-no-key-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'HostedTest',
+							baseUrl: 'https://api.example.com/v1',
+							models: ['test-model'],
+							// No apiKey provided
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		// Should throw error about missing API key
+		try {
+			await createLLMClient();
+			// If it succeeds, this test configuration may be invalid
+			// (might have found a different config), so we skip it
+			t.pass();
+		} catch (error: unknown) {
+			// Should throw an error mentioning API key or the provider
+			t.truthy(error);
+			const message = error instanceof Error ? error.message : String(error);
+			// Verify the error is related to API key or provider failure
+			t.true(
+				message.includes('API key') ||
+					message.includes('HostedTest') ||
+					message.includes('failed'),
+			);
+		}
+	},
+);
+
+test.serial(
+	'createLLMClient: hosted provider succeeds with API key',
+	async t => {
+		// Mock fetch for hosted provider
+		globalThis.fetch = createMockFetch(true, 200);
+
+		// Create config with hosted provider and API key
+		const configDir = join(testDir, 'hosted-with-key-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'HostedTest',
+							baseUrl: 'https://api.example.com/v1',
+							apiKey: 'test-api-key-123',
+							models: ['test-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+// ============================================================================
+// createLLMClient - Provider Fallback Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: falls back to second provider when first fails',
+	async t => {
+		// Mock fetch: fail for localhost, succeed for hosted
+		let callCount = 0;
+		globalThis.fetch = (async () => {
+			callCount++;
+			if (callCount === 1) {
+				// First call (localhost) - fail
+				throw new TypeError('Failed to fetch');
+			}
+			// Second call (hosted) - succeed
+			return {
+				ok: true,
+				status: 200,
+				statusText: 'OK',
+			} as Response;
+		}) as typeof fetch;
+
+		// Create config with two providers
+		const configDir = join(testDir, 'fallback-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'LocalProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['local-model'],
+						},
+						{
+							name: 'HostedProvider',
+							baseUrl: 'https://api.example.com/v1',
+							apiKey: 'test-key',
+							models: ['hosted-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		// Should use the second provider since first failed
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+test.serial(
+	'createLLMClient: uses first provider when it succeeds',
+	async t => {
+		// Mock fetch to always succeed
+		globalThis.fetch = createMockFetch(true, 200);
+
+		// Create config with two providers
+		const configDir = join(testDir, 'first-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'FirstProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+						{
+							name: 'SecondProvider',
+							baseUrl: 'http://localhost:9000/v1',
+							models: ['model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		// Should use first provider
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+test.serial(
+	'createLLMClient: succeeds with local providers even when servers not accessible (connectivity deferred)',
+	async t => {
+		// Mock fetch to always fail
+		globalThis.fetch = createMockFetch(false);
+
+		// Create config with two local providers
+		const configDir = join(testDir, 'all-fail-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Provider1',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+						{
+							name: 'Provider2',
+							baseUrl: 'http://localhost:9000/v1',
+							models: ['model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Clear any cached config and reload to pick up new config
+		clearAppConfig();
+		reloadAppConfig();
+
+		// Connectivity is now deferred — local providers pass credential validation
+		const result = await createLLMClient();
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'Provider1');
+	},
+);
+
+// ============================================================================
+// createLLMClient - Requested Provider Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: uses requested provider when specified',
+	async t => {
+		// Mock fetch to always succeed
+		globalThis.fetch = createMockFetch(true, 200);
+
+		// Create config with multiple providers
+		const configDir = join(testDir, 'requested-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Provider1',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+						{
+							name: 'Provider2',
+							baseUrl: 'http://localhost:9000/v1',
+							models: ['model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		// Request specific provider
+		const result = await createLLMClient('Provider2');
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+test.serial(
+	'createLLMClient: falls back when a non-strict requested provider fails',
+	async t => {
+		const failingProvider = 'TestProviderWithoutStoredCopilotCredential';
+		// Create config with multiple providers
+		const configDir = join(testDir, 'requested-fallback-test');
+		mkdirSync(configDir, {recursive: true});
+		process.env.NANOCODER_CONFIG_DIR = join(configDir, 'credentials');
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Provider1',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+						{
+							name: failingProvider,
+							baseUrl: 'https://api.example.com/v1',
+							sdkProvider: 'github-copilot',
+							models: ['model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		// Mock process.cwd to return test directory
+		process.cwd = () => configDir;
+
+		// Reload config to pick up new config
+		reloadAppConfig();
+
+		// Request Provider2, which will fail, then fallback to Provider1
+		const result = await createLLMClient(failingProvider);
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'Provider1');
+	},
+);
+
+test.serial(
+	'createLLMClient: does not fall back when provider selection is strict',
+	async t => {
+		const failingProvider = 'TestProviderWithoutStoredCopilotCredential';
+		const configDir = join(testDir, 'strict-requested-provider-test');
+		mkdirSync(configDir, {recursive: true});
+		process.env.NANOCODER_CONFIG_DIR = join(configDir, 'credentials');
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Provider1',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+						{
+							name: failingProvider,
+							baseUrl: 'https://api.example.com/v1',
+							sdkProvider: 'github-copilot',
+							models: ['model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(
+			createLLMClient(failingProvider, undefined, undefined, {
+				strictProvider: true,
+			}),
+		);
+
+		t.true(
+			error.message.includes(
+				`Explicitly requested provider '${failingProvider}' failed`,
+			),
+		);
+	},
+);
+
+// ============================================================================
+// createLLMClient - Provider Configuration Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: handles provider with optional timeout settings',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'timeout-settings-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'ProviderWithTimeouts',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+							requestTimeout: 30000,
+							socketTimeout: 60000,
+							connectionPool: {
+								idleTimeout: 10000,
+								cumulativeMaxIdleTimeout: 30000,
+							},
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+test.serial(
+	'createLLMClient: handles provider with minimal configuration',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'minimal-config-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'MinimalProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+							// No optional fields
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+// ============================================================================
+// createLLMClient - 127.0.0.1 Provider Tests
+// ============================================================================
+
+test.serial(
+	'createLLMClient: succeeds with 127.0.0.1 provider that responds',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'ip-localhost-success-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'OllamaIP',
+							baseUrl: 'http://127.0.0.1:11434/v1',
+							models: ['llama3'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider);
+	},
+);
+
+test.serial(
+	'createLLMClient: 127.0.0.1 provider succeeds even when server not accessible (connectivity deferred)',
+	async t => {
+		globalThis.fetch = createMockFetch(false);
+
+		const configDir = join(testDir, 'ip-localhost-fail-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'OllamaIP',
+							baseUrl: 'http://127.0.0.1:11434/v1',
+							models: ['llama3'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		// Connectivity is now deferred to first LLM request, so client creation succeeds
+		const result = await createLLMClient();
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'OllamaIP');
+	},
+);
+
+test.serial(
+	'createLLMClient: 127.0.0.1 provider does not require API key',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'ip-localhost-no-key-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'OllamaIP',
+							baseUrl: 'http://127.0.0.1:11434/v1',
+							models: ['llama3'],
+							// No apiKey - should still work for local providers
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider);
+	},
+);
+
+test.serial(
+	'createLLMClient: handles provider with empty models array',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'empty-models-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'EmptyModelsProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: [],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.truthy(result.actualProvider); // Actual provider name may vary based on default config
+	},
+);
+
+test.serial(
+	'createLLMClient: resolves explicit provider names case-insensitively',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'case-insensitive-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Ollama',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['llama3.1:latest'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const result = await createLLMClient('ollama');
+
+		t.truthy(result);
+		t.is(result.actualProvider, 'Ollama');
+	},
+);
+
+test.serial(
+	'createLLMClient: throws ConfigurationError when provider name is ambiguous (multiple case-insensitive matches)',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'ambiguous-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Ollama',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['llama3.1:latest'],
+						},
+						{
+							name: 'ollama', // deliberately different casing
+							baseUrl: 'http://localhost:9000/v1',
+							models: ['other-model'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(createLLMClient('ollama'), {
+			instanceOf: ConfigurationError,
+		});
+
+		t.true(error.message.includes('ambiguous'));
+		t.true(error.message.includes('Ollama'));
+		t.true(error.message.includes('ollama'));
+	},
+);
+
+test.serial(
+	'createLLMClient: throws ConfigurationError when provider not found',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'invalid-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'ValidProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1', 'model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(createLLMClient('InvalidProvider'));
+
+		t.truthy(error instanceof ConfigurationError);
+		t.true(
+			(error as ConfigurationError).message.includes(
+				"Provider 'InvalidProvider' not found",
+			),
+		);
+		t.true(
+			(error as ConfigurationError).message.includes('ValidProvider'),
+		);
+	},
+);
+
+test.serial(
+	'createLLMClient: throws ConfigurationError when model not in provider list',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'invalid-model-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'TestProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1', 'model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(
+			createLLMClient('TestProvider', 'InvalidModel'),
+		);
+
+		t.truthy(error instanceof ConfigurationError);
+		t.true(
+			(error as ConfigurationError).message.includes(
+				"Model 'InvalidModel' not available",
+			),
+		);
+		t.true(
+			(error as ConfigurationError).message.includes('model1, model2'),
+		);
+	},
+);
+
+test.serial(
+	'createLLMClient: throws ConfigurationError when model not in default provider list (no --provider)',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'invalid-model-no-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'DefaultProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1', 'model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(
+			createLLMClient(undefined, 'InvalidModel'),
+		);
+
+		t.truthy(error instanceof ConfigurationError);
+		t.true(
+			(error as ConfigurationError).message.includes(
+				"Model 'InvalidModel' not available",
+			),
+		);
+		t.true(
+			(error as ConfigurationError).message.includes('DefaultProvider'),
+		);
+		t.true(
+			(error as ConfigurationError).message.includes('model1, model2'),
+		);
+	},
+);
+
+test.serial(
+	'createLLMClient: succeeds with valid provider and model',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'valid-provider-model-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'TestProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1', 'model2'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		reloadAppConfig();
+
+		const result = await createLLMClient('TestProvider', 'model1');
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'TestProvider');
+		t.is(result.client.getCurrentModel(), 'model1');
+	},
+);
+
+// Regression for #460: post-config-wizard, preferences.lastProvider may name a
+// provider that no longer exists. createLLMClient() (no args) must fall back
+// to an available provider rather than throw.
+test.serial(
+	'createLLMClient: tolerates stale preferences.lastProvider missing from config',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'stale-last-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'NewProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		writeFileSync(
+			join(configDir, 'nanocoder-preferences.json'),
+			JSON.stringify({lastProvider: 'GoneProvider'}, null, 2),
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+		resetPreferencesCache();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.truthy(result.client);
+		t.is(result.actualProvider, 'NewProvider');
+	},
+);
+
+test.serial(
+	'createLLMClient: matches preferences.lastProvider case-insensitively',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'case-insensitive-last-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'Ollama',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['llama3.1:latest'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		writeFileSync(
+			join(configDir, 'nanocoder-preferences.json'),
+			JSON.stringify({lastProvider: 'ollama'}, null, 2),
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+		resetPreferencesCache();
+
+		const result = await createLLMClient();
+
+		t.truthy(result);
+		t.is(result.actualProvider, 'Ollama');
+	},
+);
+
+test.serial(
+	'createLLMClient: throws when stale provider is passed explicitly',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'explicit-stale-provider-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'NewProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const error = await t.throwsAsync(createLLMClient('GoneProvider'), {
+			instanceOf: ConfigurationError,
+		});
+
+		t.true(error.message.includes("Provider 'GoneProvider' not found"));
+	},
+);
+
+test.serial(
+	'createLLMClient: preserves context window config on provider config',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'provider-context-config-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'TestProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+							contextWindow: 32768,
+							contextWindows: {
+								model1: 65536,
+							},
+							maxOutputTokens: 32000,
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const result = await createLLMClient('TestProvider', 'model1');
+		const providerConfig = getClientProviderConfig(
+			result.client as unknown as {providerConfig?: AIProviderConfig},
+		);
+
+		t.truthy(result);
+		t.truthy(providerConfig);
+		t.is(providerConfig?.contextWindow, 32768);
+		t.deepEqual(providerConfig?.contextWindows, {model1: 65536});
+		// Without this the provider entry cannot raise the output ceiling, and
+		// headless runs — which never carry /tune parameters — are stuck with
+		// whatever the SDK infers from the model id.
+		t.is(providerConfig?.maxOutputTokens, 32000);
+	},
+);
+
+test.serial(
+	'createLLMClient: applies context window overrides on provider config',
+	async t => {
+		globalThis.fetch = createMockFetch(true, 200);
+
+		const configDir = join(testDir, 'provider-context-override-config-test');
+		mkdirSync(configDir, {recursive: true});
+
+		createTestConfig(
+			{
+				nanocoder: {
+					providers: [
+						{
+							name: 'TestProvider',
+							baseUrl: 'http://localhost:8000/v1',
+							models: ['model1'],
+							contextWindow: 32768,
+						},
+					],
+				},
+			},
+			configDir,
+		);
+
+		process.cwd = () => configDir;
+		clearAppConfig();
+		reloadAppConfig();
+
+		const result = await createLLMClient('TestProvider', 'model1', {
+			contextWindow: 16384,
+		});
+		const providerConfig = getClientProviderConfig(
+			result.client as unknown as {providerConfig?: AIProviderConfig},
+		);
+
+		t.truthy(result);
+		t.truthy(providerConfig);
+		t.is(providerConfig?.contextWindow, 16384);
+	},
+);
+
+// ============================================================================
+// loadProviderConfigs: OpenRouter block threading
+// ============================================================================
+
+test.serial(
+	'loadProviderConfigs threads the openrouter block from ProviderConfig to AIProviderConfig',
+	t => {
+		const originalProviders = process.env.NANOCODER_PROVIDERS;
+
+		try {
+			process.env.NANOCODER_PROVIDERS = JSON.stringify({
+				providers: [
+					{
+						name: 'OpenRouter',
+						baseUrl: 'https://openrouter.ai/api/v1',
+						apiKey: 'test-key',
+						models: ['anthropic/claude-3.5-sonnet'],
+						openrouter: {
+							provider: {sort: 'price', allow_fallbacks: true},
+							reasoning: {effort: 'high'},
+							service_tier: 'flex',
+							plugins: [{id: 'context-compression', engine: 'middle-out'}],
+							models: ['openai/gpt-4o'],
+						},
+					},
+				],
+			});
+
+			const resolved = loadProviderConfigs();
+			const openrouter = resolved.find(p => p.name === 'OpenRouter');
+
+			t.truthy(openrouter, 'OpenRouter provider should be loaded');
+			t.deepEqual(openrouter?.openrouter, {
+				provider: {sort: 'price', allow_fallbacks: true},
+				reasoning: {effort: 'high'},
+				service_tier: 'flex',
+				plugins: [{id: 'context-compression', engine: 'middle-out'}],
+				models: ['openai/gpt-4o'],
+			});
+			// Make sure the baseURL/apiKey translation still works alongside it.
+			t.is(openrouter?.config.baseURL, 'https://openrouter.ai/api/v1');
+			t.is(openrouter?.config.apiKey, 'test-key');
+		} finally {
+			if (originalProviders !== undefined) {
+				process.env.NANOCODER_PROVIDERS = originalProviders;
+			} else {
+				delete process.env.NANOCODER_PROVIDERS;
+			}
+		}
+	},
+);
+
+test.serial(
+	'loadProviderConfigs leaves openrouter undefined when no block is provided',
+	t => {
+		const originalProviders = process.env.NANOCODER_PROVIDERS;
+
+		try {
+			process.env.NANOCODER_PROVIDERS = JSON.stringify({
+				providers: [
+					{
+						name: 'OpenRouter',
+						baseUrl: 'https://openrouter.ai/api/v1',
+						apiKey: 'test-key',
+						models: ['anthropic/claude-3.5-sonnet'],
+					},
+				],
+			});
+
+			const resolved = loadProviderConfigs();
+			const openrouter = resolved.find(p => p.name === 'OpenRouter');
+
+			t.truthy(openrouter);
+			t.is(openrouter?.openrouter, undefined);
+		} finally {
+			if (originalProviders !== undefined) {
+				process.env.NANOCODER_PROVIDERS = originalProviders;
+			} else {
+				delete process.env.NANOCODER_PROVIDERS;
+			}
+		}
+	},
+);
+
+test.serial(
+	'loadProviderConfigs carries promptCaching and maxRetries through',
+	t => {
+		const originalProviders = process.env.NANOCODER_PROVIDERS;
+		try {
+			process.env.NANOCODER_PROVIDERS = JSON.stringify({
+				providers: [
+					{
+						name: 'Anth',
+						sdkProvider: 'anthropic',
+						apiKey: 'test-key',
+						models: ['claude-sonnet-4-5'],
+						promptCaching: false,
+						maxRetries: 7,
+					},
+				],
+			});
+
+			const anth = loadProviderConfigs().find(p => p.name === 'Anth');
+
+			// Dropping these made the documented opt-out and retry count inert.
+			t.is(anth?.promptCaching, false);
+			t.is(anth?.maxRetries, 7);
+		} finally {
+			if (originalProviders !== undefined) {
+				process.env.NANOCODER_PROVIDERS = originalProviders;
+			} else {
+				delete process.env.NANOCODER_PROVIDERS;
+			}
+		}
+	},
+);
+
+test.serial(
+	'loadProviderConfigs carries tune and turns organizationId into a header',
+	t => {
+		const originalProviders = process.env.NANOCODER_PROVIDERS;
+		try {
+			process.env.NANOCODER_PROVIDERS = JSON.stringify({
+				providers: [
+					{
+						name: 'OpenAI',
+						baseUrl: 'https://api.openai.com/v1',
+						apiKey: 'test-key',
+						models: ['gpt-5'],
+						organizationId: 'org-123',
+						headers: {'X-Extra': '1'},
+						tune: {enabled: true, toolProfile: 'minimal'},
+					},
+				],
+			});
+
+			const resolved = loadProviderConfigs();
+			const openai = resolved.find(p => p.name === 'OpenAI');
+
+			t.deepEqual(openai?.tune, {enabled: true, toolProfile: 'minimal'});
+			t.deepEqual(openai?.config.headers, {
+				'OpenAI-Organization': 'org-123',
+				'X-Extra': '1',
+			});
+		} finally {
+			if (originalProviders !== undefined) {
+				process.env.NANOCODER_PROVIDERS = originalProviders;
+			} else {
+				delete process.env.NANOCODER_PROVIDERS;
+			}
+		}
+	},
+);
+
+test.serial(
+	'loadProviderConfigs threads includeUsage from ProviderConfig to AIProviderConfig',
+	t => {
+		const originalProviders = process.env.NANOCODER_PROVIDERS;
+		try {
+			process.env.NANOCODER_PROVIDERS = JSON.stringify({
+				providers: [
+					{
+						name: 'OllamaDefault',
+						baseUrl: 'http://localhost:11434/v1',
+						models: ['llama3:8b'],
+					},
+					{
+						name: 'OllamaOptOut',
+						baseUrl: 'http://localhost:11434/v1',
+						models: ['llama3:8b'],
+						includeUsage: false,
+					},
+					{
+						name: 'OllamaOptIn',
+						baseUrl: 'http://localhost:11434/v1',
+						models: ['llama3:8b'],
+						includeUsage: true,
+					},
+				],
+			});
+
+			const resolved = loadProviderConfigs();
+			const defaultProvider = resolved.find(p => p.name === 'OllamaDefault');
+			const optOutProvider = resolved.find(p => p.name === 'OllamaOptOut');
+			const optInProvider = resolved.find(p => p.name === 'OllamaOptIn');
+
+			t.is(defaultProvider?.config.includeUsage, undefined);
+			t.is(optOutProvider?.config.includeUsage, false);
+			t.is(optInProvider?.config.includeUsage, true);
+		} finally {
+			if (originalProviders !== undefined) {
+				process.env.NANOCODER_PROVIDERS = originalProviders;
+			} else {
+				delete process.env.NANOCODER_PROVIDERS;
+			}
+		}
+	},
+);

@@ -1,0 +1,744 @@
+import test from 'ava';
+import {readFileSync} from 'node:fs';
+import {parseReviewCliArgs} from './commands/review-cli.js';
+import {
+	KNOWN_RUN_FLAGS,
+	parseRunPrompt,
+	RUN_FLAGS_STANDALONE,
+	RUN_FLAGS_WITH_VALUES,
+} from './run-prompt-args.js';
+
+// Test CLI argument parsing for non-interactive mode
+// These tests verify that the CLI correctly parses the 'run' command
+
+// The real parser, not a copy of it. A hand-written mirror used to live here
+// and had fallen six flags behind cli.tsx — see run-prompt-args.ts.
+const parsePrompt = parseRunPrompt;
+
+test('CLI parsing: detects run command with single word prompt', t => {
+	const args = ['run', 'help'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'help');
+});
+
+test('CLI parsing: detects run command with multi-word prompt', t => {
+	const args = ['run', 'tell', 'agent', 'what', 'to', 'do'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'tell agent what to do');
+});
+
+test('CLI parsing: detects run command with quoted prompt', t => {
+	const args = ['run', 'tell agent what to do'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'tell agent what to do');
+});
+
+test('CLI parsing: returns undefined when run command not present', t => {
+	const args = ['--vscode', '--vscode-port', '3000'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, undefined);
+});
+
+test('CLI parsing: returns undefined when run command has no prompt', t => {
+	const args = ['run'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, undefined);
+});
+
+test('CLI parsing: handles mixed arguments with run command', t => {
+	const args = ['--vscode', 'run', 'create', 'a', 'new', 'file'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'create a new file');
+});
+
+test('CLI parsing: handles empty args array', t => {
+	const args: string[] = [];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, undefined);
+});
+
+// New tests for flag filtering
+test('CLI parsing: filters out --vscode flag after run command', t => {
+	const args = ['run', 'create', 'a', 'file', '--vscode'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'create a file');
+});
+
+test('CLI parsing: filters out --vscode-port flag and value after run command', t => {
+	const args = ['run', 'create', 'a', 'file', '--vscode-port', '3000'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'create a file');
+});
+
+test('CLI parsing: filters out both --vscode and --vscode-port flags after run command', t => {
+	const args = [
+		'run',
+		'create',
+		'a',
+		'file',
+		'--vscode',
+		'--vscode-port',
+		'3000',
+	];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'create a file');
+});
+
+test('CLI parsing: filters out flags mixed with prompt words', t => {
+	const args = [
+		'run',
+		'create',
+		'--vscode',
+		'a',
+		'--vscode-port',
+		'3000',
+		'file',
+	];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'create a file');
+});
+
+// New tests for version and help flags
+test('CLI parsing: detects --version flag', t => {
+	const args = ['--version'];
+	const hasVersionFlag = args.includes('--version') || args.includes('-v');
+
+	t.true(hasVersionFlag);
+});
+
+test('CLI parsing: detects -v flag', t => {
+	const args = ['-v'];
+	const hasVersionFlag = args.includes('--version') || args.includes('-v');
+
+	t.true(hasVersionFlag);
+});
+
+test('CLI parsing: detects --help flag', t => {
+	const args = ['--help'];
+	const hasHelpFlag = args.includes('--help') || args.includes('-h');
+
+	t.true(hasHelpFlag);
+});
+
+test('CLI parsing: detects -h flag', t => {
+	const args = ['-h'];
+	const hasHelpFlag = args.includes('--help') || args.includes('-h');
+
+	t.true(hasHelpFlag);
+});
+
+test('CLI parsing: version flag takes precedence over other arguments', t => {
+	const args = ['--version', '--vscode', 'run', 'some', 'command'];
+	const hasVersionFlag = args.includes('--version') || args.includes('-v');
+
+	t.true(hasVersionFlag);
+});
+
+test('CLI parsing: help flag takes precedence over other arguments', t => {
+	const args = ['--help', '--vscode', 'run', 'some', 'command'];
+	const hasHelpFlag = args.includes('--help') || args.includes('-h');
+
+	t.true(hasHelpFlag);
+});
+
+test('CLI parsing: detects version flag with other arguments', t => {
+	const args = ['--vscode', '-v', '--vscode-port', '3000'];
+	const hasVersionFlag = args.includes('--version') || args.includes('-v');
+
+	t.true(hasVersionFlag);
+});
+
+test('CLI parsing: detects help flag with other arguments', t => {
+	const args = ['--vscode', '-h', '--vscode-port', '3000'];
+	const hasHelpFlag = args.includes('--help') || args.includes('-h');
+
+	t.true(hasHelpFlag);
+});
+
+// --context-max flag tests
+test('CLI parsing: filters out --context-max flag and value after run command', t => {
+	const args = ['run', 'analyze', 'code', '--context-max', '128k'];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'analyze code');
+});
+
+test('CLI parsing: filters out --context-max mixed with other flags after run', t => {
+	const args = [
+		'run',
+		'--provider',
+		'ollama',
+		'--context-max',
+		'32000',
+		'analyze',
+		'code',
+	];
+	const prompt = parsePrompt(args);
+
+	t.is(prompt, 'analyze code');
+});
+
+test('CLI parsing: extracts --context-max value from args', t => {
+	const args = ['--context-max', '128k', 'run', 'hello'];
+	const contextMaxArgIndex = args.findIndex(arg => arg === '--context-max');
+
+	t.is(contextMaxArgIndex, 0);
+	t.is(args[contextMaxArgIndex + 1], '128k');
+});
+
+test('CLI parsing: --context-max with numeric value', t => {
+	const args = ['--context-max', '32000', 'run', 'hello'];
+	const contextMaxArgIndex = args.findIndex(arg => arg === '--context-max');
+
+	t.is(contextMaxArgIndex, 0);
+	t.is(args[contextMaxArgIndex + 1], '32000');
+});
+
+// --plain / --no-plain flag tests. The plain-mode resolution rule mirrors
+// the logic in cli.tsx: explicit --plain wins, --no-plain forces Ink, and
+// otherwise it auto-enables for `run` invocations on a non-TTY or in CI.
+function resolvePlainMode(opts: {
+	args: string[];
+	stdoutIsTTY: boolean;
+	env: NodeJS.ProcessEnv;
+}): {plainMode: boolean; vscodeMode: boolean} {
+	const {args, stdoutIsTTY, env} = opts;
+	const nonInteractiveMode = args.findIndex(arg => arg === 'run') !== -1;
+	const vscodeMode = args.includes('--vscode');
+	const plainRequested = args.includes('--plain');
+	const noPlainRequested = args.includes('--no-plain');
+	const ciDetected =
+		env.CI === 'true' ||
+		Boolean(
+			env.GITHUB_ACTIONS ||
+				env.GITLAB_CI ||
+				env.BUILDKITE ||
+				env.CIRCLECI ||
+				env.JENKINS_URL,
+		);
+	const plainAuto =
+		nonInteractiveMode &&
+		!noPlainRequested &&
+		!vscodeMode &&
+		(!stdoutIsTTY || ciDetected);
+	return {plainMode: plainRequested || plainAuto, vscodeMode};
+}
+
+test('plain mode: filters --plain and --no-plain from prompt args', t => {
+	t.is(parsePrompt(['run', 'do', '--plain', 'a', 'thing']), 'do a thing');
+	t.is(parsePrompt(['run', 'do', '--no-plain', 'a', 'thing']), 'do a thing');
+});
+
+test('plain mode: explicit --plain enables it on a TTY without CI', t => {
+	const {plainMode} = resolvePlainMode({
+		args: ['--plain', 'run', 'hi'],
+		stdoutIsTTY: true,
+		env: {},
+	});
+	t.true(plainMode);
+});
+
+test('plain mode: auto-enables for run on a non-TTY', t => {
+	const {plainMode} = resolvePlainMode({
+		args: ['run', 'hi'],
+		stdoutIsTTY: false,
+		env: {},
+	});
+	t.true(plainMode);
+});
+
+test('plain mode: auto-enables for run when CI=true', t => {
+	const {plainMode} = resolvePlainMode({
+		args: ['run', 'hi'],
+		stdoutIsTTY: true,
+		env: {CI: 'true'},
+	});
+	t.true(plainMode);
+});
+
+test('plain mode: auto-enables for run when GITHUB_ACTIONS is set', t => {
+	const {plainMode} = resolvePlainMode({
+		args: ['run', 'hi'],
+		stdoutIsTTY: true,
+		env: {GITHUB_ACTIONS: 'true'},
+	});
+	t.true(plainMode);
+});
+
+test('plain mode: --no-plain wins over auto-detection', t => {
+	const {plainMode} = resolvePlainMode({
+		args: ['--no-plain', 'run', 'hi'],
+		stdoutIsTTY: false,
+		env: {CI: 'true'},
+	});
+	t.false(plainMode);
+});
+
+test('plain mode: stays off for interactive sessions even on a non-TTY', t => {
+	const {plainMode} = resolvePlainMode({
+		args: [],
+		stdoutIsTTY: false,
+		env: {CI: 'true'},
+	});
+	t.false(plainMode);
+});
+
+test('plain mode: --vscode suppresses auto-detection', t => {
+	const {plainMode, vscodeMode} = resolvePlainMode({
+		args: ['--vscode', 'run', 'hi'],
+		stdoutIsTTY: false,
+		env: {CI: 'true'},
+	});
+	t.false(plainMode);
+	t.true(vscodeMode);
+});
+
+// --alt-screen / --no-alt-screen flag tests. The resolution rule mirrors
+// the logic in cli.tsx: fullscreen (alt screen) is enabled by default in
+// interactive TTY sessions. --no-alt-screen or "alternateScreen": false in
+// preferences forces inline mode. --alt-screen explicitly enables it, and
+// the whole thing is gated on being an interactive TTY session (never in
+// nonInteractiveMode, e.g. `run`, and never off a real TTY).
+function resolveAltScreenMode(opts: {
+	args: string[];
+	stdoutIsTTY: boolean;
+	nonInteractiveMode: boolean;
+	preferenceAlternateScreen?: boolean;
+}): boolean {
+	const {args, stdoutIsTTY, nonInteractiveMode, preferenceAlternateScreen} =
+		opts;
+	const pref = preferenceAlternateScreen ?? true;
+	const altScreenAllowed =
+		!args.includes('--no-alt-screen') &&
+		(args.includes('--alt-screen') || pref === true);
+	return stdoutIsTTY && !nonInteractiveMode && altScreenAllowed;
+}
+
+test('alt-screen: on by default (no flag, no preference)', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: [],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+	});
+	t.true(useAltScreen);
+});
+
+test('alt-screen: --alt-screen flag explicitly keeps it on over a TTY', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+		preferenceAlternateScreen: true,
+	});
+	t.true(useAltScreen);
+});
+
+test('alt-screen: "alternateScreen": true preference keeps it on without the flag', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: [],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+		preferenceAlternateScreen: true,
+	});
+	t.true(useAltScreen);
+});
+
+test('alt-screen: --no-alt-screen turns it off', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--no-alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+	});
+	t.false(useAltScreen);
+});
+
+test('alt-screen: --no-alt-screen overrides the --alt-screen flag', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--alt-screen', '--no-alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+	});
+	t.false(useAltScreen);
+});
+
+test('alt-screen: --no-alt-screen overrides the persisted preference', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--no-alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+		preferenceAlternateScreen: true,
+	});
+	t.false(useAltScreen);
+});
+
+test('alt-screen: "alternateScreen": false preference turns it off without the flag', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: [],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+		preferenceAlternateScreen: false,
+	});
+	t.false(useAltScreen);
+});
+
+test('alt-screen: --alt-screen overrides "alternateScreen": false preference', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+		preferenceAlternateScreen: false,
+	});
+	t.true(useAltScreen);
+});
+
+test('alt-screen: never enabled off a non-TTY, even with the flag or default', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--alt-screen'],
+		stdoutIsTTY: false,
+		nonInteractiveMode: false,
+	});
+	t.false(useAltScreen);
+});
+
+test('alt-screen: never enabled for non-interactive `run` mode, even with the flag or default', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: true,
+	});
+	t.false(useAltScreen);
+});
+
+test('alt-screen: flag and preference both true is not double-negated', t => {
+	const useAltScreen = resolveAltScreenMode({
+		args: ['--alt-screen'],
+		stdoutIsTTY: true,
+		nonInteractiveMode: false,
+		preferenceAlternateScreen: true,
+	});
+	t.true(useAltScreen);
+});
+
+// --continue / -c and --resume / -r flag parsing tests. Mirrors the logic in
+// cli.tsx: mutual exclusion, optional id/index after --resume, and rejection
+// when combined with the `run` command.
+function resolveResumeFlags(args: string[]): {
+	continueRequested: boolean;
+	resumeRequested: boolean;
+	resumeArg: string | undefined;
+	mutuallyExclusiveError: boolean;
+	nonInteractiveError: boolean;
+} {
+	const nonInteractiveMode = args.findIndex(arg => arg === 'run') !== -1;
+
+	const continueRequested =
+		args.includes('--continue') || args.includes('-c');
+	const resumeFlagIndex = args.findIndex(
+		arg => arg === '--resume' || arg === '-r',
+	);
+	const resumeRequested = resumeFlagIndex !== -1;
+
+	const mutuallyExclusiveError = continueRequested && resumeRequested;
+
+	let resumeArg: string | undefined;
+	if (resumeRequested) {
+		const next = args[resumeFlagIndex + 1];
+		if (next && !next.startsWith('-') && next !== 'run') {
+			resumeArg = next;
+		}
+	}
+
+	const nonInteractiveError =
+		(continueRequested || resumeRequested) &&
+		nonInteractiveMode &&
+		!mutuallyExclusiveError;
+
+	return {
+		continueRequested,
+		resumeRequested,
+		resumeArg,
+		mutuallyExclusiveError,
+		nonInteractiveError,
+	};
+}
+
+test('resume flags: detects --continue', t => {
+	const {continueRequested} = resolveResumeFlags(['--continue']);
+	t.true(continueRequested);
+});
+
+test('resume flags: detects -c shorthand', t => {
+	const {continueRequested} = resolveResumeFlags(['-c']);
+	t.true(continueRequested);
+});
+
+test('resume flags: detects --resume with no id', t => {
+	const {resumeRequested, resumeArg} = resolveResumeFlags(['--resume']);
+	t.true(resumeRequested);
+	t.is(resumeArg, undefined);
+});
+
+test('resume flags: detects -r shorthand with no id', t => {
+	const {resumeRequested, resumeArg} = resolveResumeFlags(['-r']);
+	t.true(resumeRequested);
+	t.is(resumeArg, undefined);
+});
+
+test('resume flags: captures an id after --resume', t => {
+	const {resumeRequested, resumeArg} = resolveResumeFlags([
+		'--resume',
+		'last',
+	]);
+	t.true(resumeRequested);
+	t.is(resumeArg, 'last');
+});
+
+test('resume flags: captures a numeric index after -r', t => {
+	const {resumeArg} = resolveResumeFlags(['-r', '2']);
+	t.is(resumeArg, '2');
+});
+
+test('resume flags: captures a raw uuid after --resume', t => {
+	const {resumeArg} = resolveResumeFlags([
+		'--resume',
+		'123e4567-e89b-42d3-a456-426614174000',
+	]);
+	t.is(resumeArg, '123e4567-e89b-42d3-a456-426614174000');
+});
+
+test('resume flags: does not treat a following flag as the resume id', t => {
+	const {resumeArg} = resolveResumeFlags(['--resume', '--alt-screen']);
+	t.is(resumeArg, undefined);
+});
+
+test('resume flags: does not treat a following `run` as the resume id', t => {
+	const {resumeArg} = resolveResumeFlags(['--resume', 'run', 'do a thing']);
+	t.is(resumeArg, undefined);
+});
+
+test('resume flags: --continue and --resume together is an error', t => {
+	const {mutuallyExclusiveError} = resolveResumeFlags([
+		'--continue',
+		'--resume',
+	]);
+	t.true(mutuallyExclusiveError);
+});
+
+test('resume flags: -c and -r together is an error', t => {
+	const {mutuallyExclusiveError} = resolveResumeFlags(['-c', '-r']);
+	t.true(mutuallyExclusiveError);
+});
+
+test('resume flags: neither flag alone is not a mutual-exclusion error', t => {
+	t.false(resolveResumeFlags(['--continue']).mutuallyExclusiveError);
+	t.false(resolveResumeFlags(['--resume']).mutuallyExclusiveError);
+	t.false(resolveResumeFlags([]).mutuallyExclusiveError);
+});
+
+test('resume flags: --continue combined with `run` is an error', t => {
+	const {nonInteractiveError} = resolveResumeFlags(['--continue', 'run', 'hi']);
+	t.true(nonInteractiveError);
+});
+
+test('resume flags: --resume combined with `run` is an error', t => {
+	const {nonInteractiveError} = resolveResumeFlags(['--resume', 'run', 'hi']);
+	t.true(nonInteractiveError);
+});
+
+test('resume flags: --continue without `run` is not a non-interactive error', t => {
+	const {nonInteractiveError} = resolveResumeFlags(['--continue']);
+	t.false(nonInteractiveError);
+});
+
+test('--prompt-file and its value do not leak into the prompt', t => {
+	// The prompt itself comes from the file; anything left in argv would be
+	// prepended to it as stray text.
+	t.is(parsePrompt(['run', '--prompt-file', '/tmp/p.txt']), '');
+	t.is(parsePrompt(['run', '--prompt-file=/tmp/p.txt']), '');
+	t.is(
+		parsePrompt(['run', '--prompt-file', '/tmp/p.txt', '--mode', 'yolo']),
+		'',
+	);
+});
+
+test('a positional prompt alongside --prompt-file still parses from argv', t => {
+	// The file wins at the call site; this only asserts the flag is stripped
+	// rather than swallowing the word after it.
+	t.is(parsePrompt(['run', 'hello', '--prompt-file', '/tmp/p.txt']), 'hello');
+});
+
+
+test('every flag the parser knows is stripped from the prompt', t => {
+	// Derived from the parser's own list rather than a list written here, so a
+	// flag added to the parser is covered the moment it is added. The previous
+	// version of this test enumerated six flags by hand and would have gone
+	// quiet on the seventh — which is the failure it was written to prevent.
+	for (const flag of RUN_FLAGS_WITH_VALUES) {
+		t.is(parsePrompt(['run', 'x', flag, 'value']), 'x', `${flag} <value>`);
+		t.is(parsePrompt(['run', 'x', `${flag}=value`]), 'x', `${flag}=value`);
+	}
+	for (const flag of RUN_FLAGS_STANDALONE) {
+		t.is(parsePrompt(['run', 'x', flag]), 'x', flag);
+	}
+});
+
+test('KNOWN_RUN_FLAGS covers every long flag the CLI documents', t => {
+	// The other direction: a flag added to --help but not to the parser would
+	// otherwise be silently swallowed into the prompt.
+	const help = readFileSync('source/cli.tsx', 'utf8');
+	const documented = new Set(
+		[...help.matchAll(/^\s{2}(--[a-z][a-z-]+)/gm)].map(m => m[1]),
+	);
+	const unhandled = [...documented].filter(
+		flag =>
+			!KNOWN_RUN_FLAGS.includes(flag) &&
+			// Flags that legitimately never appear after `run`.
+			![
+				// Never valid after `run`.
+				'--version',
+				'--help',
+				'--acp',
+				'--continue',
+				'--resume',
+				// `nanocoder init` flags.
+				'--preset',
+				'--lean',
+			].includes(flag),
+	);
+	t.deepEqual(unhandled, [], `documented but not stripped: ${unhandled}`);
+});
+
+// Run command with flags before 'run'
+test('CLI parsing: handles flags before run command', t => {
+	const args = ['--plain', 'run', 'say', 'hi'];
+	const prompt = parsePrompt(args);
+	t.is(prompt, 'say hi');
+});
+
+test('CLI parsing: handles --provider before run command', t => {
+	const args = ['--provider', 'ollama', 'run', 'analyze', 'code'];
+	const prompt = parsePrompt(args);
+	t.is(prompt, 'analyze code');
+});
+
+test('CLI parsing: handles --mode before run command', t => {
+	const args = ['--mode', 'plan', 'run', 'audit', 'module'];
+	const prompt = parsePrompt(args);
+	t.is(prompt, 'audit module');
+});
+
+// Review guard tests — mirrors the guards in cli.tsx
+function resolveReviewGuards(opts: {
+	args: string[];
+	stdoutIsTTY: boolean;
+	outputFormat: string;
+}): {ttyError: boolean; jsonError: boolean; collisionError: boolean} {
+	const {args, stdoutIsTTY, outputFormat} = opts;
+	const isRunCommand = args.indexOf('run') !== -1;
+	const isReviewCommand = args[0] === 'review';
+	const ttyError = isReviewCommand && !stdoutIsTTY;
+	const jsonError = isReviewCommand && outputFormat === 'json';
+	const collisionError = isRunCommand && isReviewCommand;
+	return {ttyError, jsonError, collisionError};
+}
+
+test('review guard: errors when stdout is not a TTY', t => {
+	const {ttyError} = resolveReviewGuards({
+		args: ['review', 'main'],
+		stdoutIsTTY: false,
+		outputFormat: 'text',
+	});
+	t.true(ttyError);
+});
+
+test('review guard: passes on a TTY', t => {
+	const {ttyError} = resolveReviewGuards({
+		args: ['review', 'main'],
+		stdoutIsTTY: true,
+		outputFormat: 'text',
+	});
+	t.false(ttyError);
+});
+
+test('review guard: --json is rejected with review', t => {
+	const {jsonError} = resolveReviewGuards({
+		args: ['review', 'main'],
+		stdoutIsTTY: true,
+		outputFormat: 'json',
+	});
+	t.true(jsonError);
+});
+
+test('review guard: --json is not rejected with run', t => {
+	const {jsonError} = resolveReviewGuards({
+		args: ['run', 'hello'],
+		stdoutIsTTY: true,
+		outputFormat: 'json',
+	});
+	t.false(jsonError);
+});
+
+test('review guard: run and review collision is detected', t => {
+	const {collisionError} = resolveReviewGuards({
+		args: ['review', 'run'],
+		stdoutIsTTY: true,
+		outputFormat: 'text',
+	});
+	t.true(collisionError);
+});
+
+test('review guard: review alone has no collision', t => {
+	const {collisionError} = resolveReviewGuards({
+		args: ['review', 'main'],
+		stdoutIsTTY: true,
+		outputFormat: 'text',
+	});
+	t.false(collisionError);
+});
+
+test('review guard: run alone has no collision', t => {
+	const {collisionError} = resolveReviewGuards({
+		args: ['run', 'hello'],
+		stdoutIsTTY: true,
+		outputFormat: 'text',
+	});
+	t.false(collisionError);
+});
+
+test('every flag the parser knows is stripped from the review target', t => {
+	// `review` shares the `run` flag list rather than keeping its own copy. A
+	// hand-maintained second list had already drifted: it did not know
+	// --mouse/--no-mouse, so `nanocoder review --mouse main` reported the
+	// branch name as an extra argument. Derived from the parser's own lists so
+	// the next flag added is covered the moment it is added.
+	for (const flag of RUN_FLAGS_WITH_VALUES) {
+		t.deepEqual(
+			parseReviewCliArgs(['review', flag, 'value', 'main']).prompt,
+			'/review main',
+			`${flag} <value>`,
+		);
+		t.deepEqual(
+			parseReviewCliArgs(['review', `${flag}=value`, 'main']).prompt,
+			'/review main',
+			`${flag}=value`,
+		);
+	}
+	for (const flag of RUN_FLAGS_STANDALONE) {
+		t.deepEqual(
+			parseReviewCliArgs(['review', flag, 'main']).prompt,
+			'/review main',
+			flag,
+		);
+	}
+});

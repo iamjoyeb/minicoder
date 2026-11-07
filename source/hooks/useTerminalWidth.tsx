@@ -1,0 +1,160 @@
+import cliTruncate from 'cli-truncate';
+import {useEffect, useState} from 'react';
+import {DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_WIDTH} from '@/constants';
+
+type TerminalSize = 'narrow' | 'normal' | 'wide';
+
+// Calculate box width (leave some padding and ensure minimum width)
+export const calculateBoxWidth = (columns: number) =>
+	Math.max(Math.min(columns - 4, DEFAULT_TERMINAL_WIDTH), 40);
+
+const computeColumns = () => process.stdout.columns || DEFAULT_TERMINAL_COLUMNS;
+
+// A single shared 'resize' listener fans out to every column consumer. Each
+// hook instance used to attach its own stdout listener, so a long
+// conversation — or a resumed session replaying many messages at once — would
+// exceed the EventEmitter max-listener limit and log a
+// MaxListenersExceededWarning. One listener, many subscribers, no leak and no
+// need to raise the limit.
+const subscribers = new Set<(columns: number) => void>();
+let sharedListener: (() => void) | null = null;
+
+function subscribe(onChange: (columns: number) => void): () => void {
+	subscribers.add(onChange);
+
+	if (!sharedListener) {
+		sharedListener = () => {
+			const newColumns = computeColumns();
+			for (const notify of subscribers) {
+				notify(newColumns);
+			}
+		};
+		process.stdout.on('resize', sharedListener);
+	}
+
+	return () => {
+		subscribers.delete(onChange);
+		// Detach the shared listener once nothing is listening anymore.
+		if (subscribers.size === 0 && sharedListener) {
+			process.stdout.off('resize', sharedListener);
+			sharedListener = null;
+		}
+	};
+}
+
+const DEFAULT_TERMINAL_ROWS = 24;
+
+const computeRows = () => process.stdout.rows || DEFAULT_TERMINAL_ROWS;
+
+// Same shared-listener pattern as width, but for rows. Kept as a separate
+// subscriber set so width consumers don't re-render on height-only changes.
+const rowSubscribers = new Set<(rows: number) => void>();
+let sharedRowListener: (() => void) | null = null;
+
+function subscribeRows(onChange: (rows: number) => void): () => void {
+	rowSubscribers.add(onChange);
+
+	if (!sharedRowListener) {
+		sharedRowListener = () => {
+			const newRows = computeRows();
+			for (const notify of rowSubscribers) {
+				notify(newRows);
+			}
+		};
+		process.stdout.on('resize', sharedRowListener);
+	}
+
+	return () => {
+		rowSubscribers.delete(onChange);
+		if (rowSubscribers.size === 0 && sharedRowListener) {
+			process.stdout.off('resize', sharedRowListener);
+			sharedRowListener = null;
+		}
+	};
+}
+
+/**
+ * Reactive terminal height in rows. Drives the fixed-height fullscreen
+ * layout: the interactive app sizes its root Box to exactly this many rows
+ * so the frame never exceeds the alternate-screen viewport.
+ */
+export const useTerminalRows = () => {
+	const [rows, setRows] = useState(computeRows);
+
+	useEffect(() => {
+		setRows(computeRows());
+		return subscribeRows(setRows);
+	}, []);
+
+	return rows;
+};
+
+/**
+ * Reactive raw terminal width in columns. Everything width-related derives
+ * from this: subscribing to the clamped box width instead would swallow any
+ * resize that lands inside a clamp (below 44 or above 204 columns), leaving
+ * consumers rendering for a terminal size that no longer exists.
+ */
+const useTerminalColumns = () => {
+	const [columns, setColumns] = useState(computeColumns);
+
+	useEffect(() => {
+		// Reconcile any resize that happened between initial render and mount,
+		// then track future resizes via the shared listener. setState is a no-op
+		// when the count is unchanged, so this won't cause an extra render.
+		setColumns(computeColumns());
+		return subscribe(setColumns);
+	}, []);
+
+	return columns;
+};
+
+export const useTerminalWidth = () => calculateBoxWidth(useTerminalColumns());
+
+/**
+ * Hook to detect terminal size category and provide responsive utilities
+ * @returns Object with terminal width, size category, and utility functions
+ */
+export const useResponsiveTerminal = () => {
+	// Derived from the same subscription rather than calling useTerminalWidth(),
+	// which would add a second subscription and state to every consumer for the
+	// same number. calculateBoxWidth stays the one definition of the clamp.
+	const actualWidth = useTerminalColumns();
+	const boxWidth = calculateBoxWidth(actualWidth);
+
+	// Define breakpoints for terminal sizes
+	const getSize = (width: number): TerminalSize => {
+		if (width < 80) return 'narrow';
+		if (width < 120) return 'normal';
+		return 'wide';
+	};
+
+	const size = getSize(actualWidth);
+
+	// Utility to truncate long text with ellipsis, budgeted in terminal
+	// columns rather than UTF-16 code units - a double-width CJK ideograph or
+	// emoji is one code unit but two columns, so a code-unit budget let a
+	// "truncated" line render at roughly twice maxLength and wrap.
+	const truncate = (text: string, maxLength: number): string =>
+		cliTruncate(text, maxLength, {truncationCharacter: '...'});
+
+	// Utility to truncate path intelligently (keep end of path)
+	const truncatePath = (
+		pathStr: string | undefined,
+		maxLength: number,
+	): string => {
+		if (!pathStr || pathStr.length <= maxLength) return pathStr || '';
+		return '...' + pathStr.slice(-(maxLength - 3));
+	};
+
+	return {
+		boxWidth,
+		actualWidth,
+		size,
+		isNarrow: size === 'narrow',
+		isNormal: size === 'normal',
+		isWide: size === 'wide',
+		truncate,
+		truncatePath,
+	};
+};

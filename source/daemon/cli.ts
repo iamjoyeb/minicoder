@@ -1,0 +1,647 @@
+/**
+ * CLI surface for `nanocoder daemon <subcommand>`. Each handler returns a
+ * `{exitCode, output}` pair so the wiring in `cli.tsx` (step 21) can fan
+ * those to the right stdout/stderr streams without each handler needing
+ * to know.
+ *
+ * `start` is special: it must spawn the daemon entry point detached from
+ * the parent terminal. The default uses `child_process.spawn`; tests
+ * inject a stub launcher.
+ *
+ * See `agents/2026-05-20-skills-unification-plan.md` step 19.
+ */
+
+import {type ChildProcess, spawn} from 'node:child_process';
+import {
+	createReadStream,
+	existsSync,
+	mkdirSync,
+	openSync,
+	statSync,
+} from 'node:fs';
+import {dirname, join, resolve} from 'node:path';
+import {createInterface} from 'node:readline/promises';
+import {fileURLToPath} from 'node:url';
+import {getAppConfig} from '@/config/index';
+import {ensureDirectoryTrust, untrustedReason} from '@/config/preferences';
+import {ensureNanocoderGitignore} from '@/utils/ensure-nanocoder-gitignore';
+import {formatError} from '@/utils/error-formatter';
+import {isTrustLevel, resolveTrustLevel, type TrustLevel} from '@/verify/trust';
+import {
+	isFullCommitTrustConfirmed,
+	recordFullCommitTrustConfirmed,
+} from './full-commit-trust';
+import {getLockfilePath, readLiveLockfile, readLockfile} from './lockfile';
+
+function getLogPath(projectRoot: string): string {
+	return join(projectRoot, '.nanocoder', 'daemon.log');
+}
+
+const TRUST_LEVEL_LIST = 'comment-only, auto-fix, full-commit';
+
+const START_USAGE =
+	'Usage: nanocoder daemon start [--trust <comment-only|auto-fix|full-commit>] [--trust-directory]';
+
+interface ParsedStartArgs {
+	trustLevel?: TrustLevel;
+}
+
+function parseTrustValue(
+	value: string | undefined,
+): TrustLevel | {error: string} {
+	// `--trust --trust-directory` / a trailing `--trust`: the level is
+	// missing, not invalid - say that rather than `Invalid --trust value: ""`.
+	if (value === undefined || value === '' || value.startsWith('-')) {
+		return {error: `--trust requires a level: one of ${TRUST_LEVEL_LIST}.`};
+	}
+	if (!isTrustLevel(value)) {
+		return {
+			error: `Invalid --trust value: "${value}". Must be one of ${TRUST_LEVEL_LIST}.`,
+		};
+	}
+	return value;
+}
+
+/**
+ * Parse `daemon start`'s flags. Mirrors `verify/cli.ts`'s `parseArgs`:
+ * hand-rolled loop, unknown-flag rejection, discriminated-union return.
+ * `--trust` is the CI investigation trust level; it is unrelated to
+ * `--trust-directory` (the directory trust gate).
+ */
+function parseStartArgs(args: string[]): ParsedStartArgs | {error: string} {
+	let trustLevel: TrustLevel | undefined;
+
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i] ?? '';
+		if (arg === '--trust' || arg.startsWith('--trust=')) {
+			let raw: string | undefined;
+			if (arg === '--trust') {
+				raw = args[i + 1];
+				// Don't swallow the next flag as the value.
+				if (raw !== undefined && !raw.startsWith('-')) i++;
+			} else {
+				raw = arg.slice('--trust='.length);
+			}
+			const parsed = parseTrustValue(raw);
+			if (typeof parsed === 'object') return parsed;
+			trustLevel = parsed;
+		} else if (arg === '--trust-directory') {
+			// Handled by cli.tsx (passed as `trustDirectory`); not a start-arg here.
+		} else {
+			return {error: `Unknown flag: "${arg}".`};
+		}
+	}
+
+	return {trustLevel};
+}
+
+const FULL_COMMIT_WARNING = (projectRoot: string) => `
+⚠️  Security Warning — full-commit trust
+
+You're starting the daemon with --trust full-commit for:
+  ${projectRoot}
+
+At this trust level, when CI watch detects a failure, the daemon will
+autonomously edit files, commit, and PUSH DIRECTLY to the failing branch —
+with no human review step and no draft PR. This is equivalent to yolo mode
+for an unattended background process watching your repository.
+
+Only enable this on a project/branch where you're comfortable with an
+automated agent pushing commits without your review.
+
+This warning will not be shown again for this project.
+`;
+
+/**
+ * Default confirmation prompt for `--trust full-commit`. `daemon start`
+ * runs in the plain CLI fast-path (no Ink tree is ever mounted for it —
+ * `cli.tsx`'s daemon block exits via `process.exit()` before importing
+ * `@/app`), so a plain readline prompt is the correct mechanism here, not
+ * a stopgap.
+ */
+async function defaultConfirmFullCommitTrust(
+	projectRoot: string,
+): Promise<boolean> {
+	// A scripted/backgrounded start has nobody to answer; waiting on stdin
+	// would hang `daemon start` before the lockfile is ever written.
+	if (!process.stdin.isTTY) return false;
+	process.stdout.write(FULL_COMMIT_WARNING(projectRoot));
+	const rl = createInterface({input: process.stdin, output: process.stdout});
+	try {
+		const answer = await rl.question('Proceed? [y/N] ');
+		return (
+			answer.trim().toLowerCase() === 'y' ||
+			answer.trim().toLowerCase() === 'yes'
+		);
+	} finally {
+		rl.close();
+	}
+}
+
+export const CONFIG_AUTO_FIX_WARNING = (projectRoot: string) => `
+Warning: agents.config.json sets verify.trustLevel to auto-fix for:
+  ${projectRoot}
+
+At this trust level, when CI watch detects a failure, the daemon runs an
+agent that edits files and commits them with no confirmation, steered by
+the failed CI log, then opens a draft PR with its fix. The agent has no
+shell; the CI run on the draft PR verifies the fix.
+
+The level came from a config file, not from --trust on this command, so it
+needs your confirmation. Pass --trust auto-fix to skip this prompt.
+`;
+
+/**
+ * Default confirmation for an elevated trust level that came from
+ * agents.config.json rather than the --trust flag. A config file can be
+ * committed by someone else (or changed by the PR the daemon is watching),
+ * so it must not raise the level on its own.
+ */
+async function defaultConfirmConfigAutoFixTrust(
+	projectRoot: string,
+): Promise<boolean> {
+	if (!process.stdin.isTTY) return false;
+	process.stdout.write(CONFIG_AUTO_FIX_WARNING(projectRoot));
+	const rl = createInterface({input: process.stdin, output: process.stdout});
+	try {
+		const answer = (await rl.question('Proceed? [y/N] ')).trim().toLowerCase();
+		return answer === 'y' || answer === 'yes';
+	} finally {
+		rl.close();
+	}
+}
+
+export interface DaemonCliResult {
+	exitCode: 0 | 1;
+	output: string;
+}
+
+export type DaemonCliCommand =
+	| 'start'
+	| 'stop'
+	| 'status'
+	| 'logs'
+	| 'install'
+	| 'uninstall';
+
+export interface DaemonCliOptions {
+	projectRoot: string;
+	/**
+	 * Launch the detached daemon process. Tests pass a stub that records the
+	 * arguments without actually forking. Production uses
+	 * `defaultLaunchDaemon`.
+	 */
+	launchDaemon?: (
+		projectRoot: string,
+		trustLevel: TrustLevel,
+	) => ChildProcess | null;
+	/** Raw argv after the subcommand — only `start` consumes this. */
+	args?: string[];
+	/** Test seam: override the one-time full-commit confirmation prompt. */
+	confirmFullCommitTrust?: (projectRoot: string) => Promise<boolean>;
+	/** Test seam: override the confirmation for `auto-fix` set by
+	 * agents.config.json rather than the --trust flag. */
+	confirmConfigAutoFixTrust?: (projectRoot: string) => Promise<boolean>;
+	/** Test seam: whether an interactive terminal can answer a prompt. */
+	isInteractive?: () => boolean;
+	/** Test seam: override the persisted confirmation check. */
+	isFullCommitTrustConfirmedFn?: typeof isFullCommitTrustConfirmed;
+	/** Test seam: override persisting the confirmation. */
+	recordFullCommitTrustConfirmedFn?: typeof recordFullCommitTrustConfirmed;
+	/** Test seam: override reading the project-level trust-level config,
+	 * avoiding `getAppConfig()`'s real cwd-based filesystem reads in tests. */
+	loadVerifyConfigFn?: () => {trustLevel?: TrustLevel} | undefined;
+	/**
+	 * One-shot override for `start`'s directory-trust gate (`--trust-directory`
+	 * on `nanocoder daemon start`), mirroring the `run` command's flag of the
+	 * same name. Never persisted — set `NANOCODER_TRUST_DIRECTORY=1` instead
+	 * to trust the directory for future runs too. Ignored by every other
+	 * subcommand.
+	 */
+	trustDirectory?: boolean;
+}
+
+/**
+ * Default launcher: spawns a detached `node <daemonEntry>` with the
+ * project root in its environment. Stdio is redirected to the daemon log
+ * file.
+ */
+function defaultLaunchDaemon(
+	projectRoot: string,
+	daemonEntry: string,
+	trustLevel: TrustLevel,
+): ChildProcess {
+	const logPath = getLogPath(projectRoot);
+	mkdirSync(dirname(logPath), {recursive: true});
+	// Append mode so subsequent runs don't clobber the log.
+	const logFd = openSync(logPath, 'a');
+	const child = spawn(process.execPath, [daemonEntry], {
+		cwd: projectRoot,
+		env: {
+			...process.env,
+			NANOCODER_PROJECT_ROOT: projectRoot,
+			NANOCODER_DAEMON_PROCESS: '1',
+			NANOCODER_CI_TRUST_LEVEL: trustLevel,
+		},
+		detached: true,
+		stdio: ['ignore', logFd, logFd],
+	});
+	child.unref();
+	return child;
+}
+
+export async function runDaemonCli(
+	command: DaemonCliCommand,
+	opts: DaemonCliOptions,
+): Promise<DaemonCliResult> {
+	// `--help` must never fall through to the action: `daemon install --help`
+	// would otherwise install the auto-start unit.
+	const args = opts.args ?? [];
+	if (args.includes('--help') || args.includes('-h')) {
+		return {
+			exitCode: 0,
+			output:
+				command === 'start'
+					? START_USAGE
+					: `Usage: nanocoder daemon ${command}`,
+		};
+	}
+	switch (command) {
+		case 'start':
+			return start(opts);
+		case 'stop':
+			return stop(opts);
+		case 'status':
+			return status(opts);
+		case 'logs':
+			return logs(opts);
+		case 'install':
+			return installCommand(opts);
+		case 'uninstall':
+			return uninstallCommand(opts);
+	}
+}
+
+async function installCommand(
+	opts: DaemonCliOptions,
+): Promise<DaemonCliResult> {
+	const {installAutoStart} = await import('./install');
+	const result = await installAutoStart({projectRoot: opts.projectRoot});
+	return {
+		exitCode: result.platform === 'unsupported' ? 1 : 0,
+		output: result.message,
+	};
+}
+
+async function uninstallCommand(
+	opts: DaemonCliOptions,
+): Promise<DaemonCliResult> {
+	const {uninstallAutoStart} = await import('./install');
+	const result = await uninstallAutoStart({projectRoot: opts.projectRoot});
+	return {exitCode: 0, output: result.message};
+}
+
+async function start(opts: DaemonCliOptions): Promise<DaemonCliResult> {
+	const parsed = parseStartArgs(opts.args ?? []);
+	if ('error' in parsed) {
+		return {exitCode: 1, output: `${parsed.error}\n${START_USAGE}`};
+	}
+
+	const live = await readLiveLockfile(opts.projectRoot);
+	if (live) {
+		const current = isTrustLevel(live.ciTrustLevel)
+			? ` CI trust level: ${live.ciTrustLevel}.`
+			: '';
+		const notApplied = parsed.trustLevel
+			? ` --trust ${parsed.trustLevel} was not applied; run \`nanocoder daemon stop\` and start it again to change the level.`
+			: '';
+		return {
+			exitCode: 0,
+			output: `Daemon already running (pid ${live.pid}).${current}${notApplied}`,
+		};
+	}
+
+	// The daemon loads every .nanocoder/agents|commands|tools/*.md and
+	// skills/<name>/skill.yaml in the project and runs triggered skills in
+	// headless mode - no confirmation prompts, including for execute_bash.
+	// It must never boot in a directory the user hasn't trusted.
+	const trust = ensureDirectoryTrust(
+		opts.projectRoot,
+		opts.trustDirectory ?? false,
+	);
+	if (trust.persisted) {
+		console.log(
+			`Marked ${resolve(opts.projectRoot)} as trusted (NANOCODER_TRUST_DIRECTORY=1).`,
+		);
+	}
+	if (trust.persistFailed) {
+		// The run proceeds (the env var does grant trust), but the write that
+		// was supposed to make it stick did not land: the next boot will refuse
+		// this directory again. Say so here — `savePreferences` only reaches a
+		// log file, and silence would make the next refusal look arbitrary.
+		console.warn(
+			`Could not save trust for ${resolve(opts.projectRoot)} (NANOCODER_TRUST_DIRECTORY=1): ` +
+				`the next \`nanocoder daemon start\` will refuse this directory again. ` +
+				`Check that the preferences directory is writable.`,
+		);
+	}
+	if (!trust.trusted) {
+		return {
+			exitCode: 1,
+			output:
+				`Directory ${resolve(opts.projectRoot)} ` +
+				untrustedReason(trust.recheck) +
+				`. The daemon runs ` +
+				`triggered skills unattended with no confirmation prompts, so it refuses ` +
+				`to start here. Run \`nanocoder\` interactively in this directory once to ` +
+				`accept the trust disclaimer, then re-run \`nanocoder daemon start\` - or ` +
+				`pass --trust-directory to bypass it for this run only (set ` +
+				`NANOCODER_TRUST_DIRECTORY=1 to persist it instead).`,
+		};
+	}
+
+	const loadVerifyConfig =
+		opts.loadVerifyConfigFn ?? (() => getAppConfig().verify);
+	const configTrustLevel = loadVerifyConfig()?.trustLevel;
+	let trustLevel = resolveTrustLevel(parsed.trustLevel, configTrustLevel);
+	let trustSource = parsed.trustLevel
+		? '--trust flag'
+		: configTrustLevel
+			? 'agents.config.json'
+			: 'default';
+
+	const isConfirmed =
+		opts.isFullCommitTrustConfirmedFn ?? isFullCommitTrustConfirmed;
+	const isInteractive = opts.isInteractive ?? (() => !!process.stdin.isTTY);
+
+	// An elevated level from agents.config.json (which may be the project's
+	// own committed file) must be confirmed by the user. Unattended starts
+	// (`daemon install`'s service, scripts) cannot answer, so they fall back
+	// to comment-only instead of failing to start at all. A project already
+	// confirmed for full-commit has accepted a superset of auto-fix's risk.
+	if (!parsed.trustLevel && trustLevel !== 'comment-only') {
+		const alreadyConfirmed = isConfirmed(opts.projectRoot);
+		if (!alreadyConfirmed && !isInteractive()) {
+			const requested = trustLevel;
+			trustLevel = 'comment-only';
+			trustSource = `agents.config.json asked for ${requested}, which needs a one-time interactive confirmation (or --trust ${requested}) - using comment-only`;
+		} else if (!alreadyConfirmed && trustLevel === 'auto-fix') {
+			const confirm =
+				opts.confirmConfigAutoFixTrust ?? defaultConfirmConfigAutoFixTrust;
+			if (!(await confirm(opts.projectRoot))) {
+				return {
+					exitCode: 1,
+					output:
+						'Aborted: auto-fix trust from agents.config.json was not confirmed. ' +
+						'Pass --trust comment-only to start without it, or --trust auto-fix to opt in explicitly.',
+				};
+			}
+		}
+	}
+
+	if (trustLevel === 'full-commit') {
+		if (!isConfirmed(opts.projectRoot)) {
+			const confirm =
+				opts.confirmFullCommitTrust ?? defaultConfirmFullCommitTrust;
+			const confirmed = await confirm(opts.projectRoot);
+			if (!confirmed) {
+				return {
+					exitCode: 1,
+					output:
+						'Aborted: full-commit trust was not confirmed. It needs a one-time ' +
+						'interactive confirmation: run `nanocoder daemon start --trust full-commit` ' +
+						'once from a terminal.',
+				};
+			}
+			(opts.recordFullCommitTrustConfirmedFn ?? recordFullCommitTrustConfirmed)(
+				opts.projectRoot,
+			);
+		}
+	}
+
+	await ensureNanocoderGitignore(opts.projectRoot);
+	const launcher = opts.launchDaemon ?? launchSelfHosted;
+	const child = launcher(opts.projectRoot, trustLevel);
+	if (!child) {
+		return {
+			exitCode: 1,
+			output: 'Failed to spawn daemon process.',
+		};
+	}
+
+	// Wait briefly for the daemon to write its lockfile, so `start` reports
+	// success only if the boot actually happened.
+	const lock = await waitForLockfile(opts.projectRoot, 5000);
+	if (!lock) {
+		return {
+			exitCode: 1,
+			output:
+				'Daemon process spawned but did not write a lockfile within 5s. Check the daemon log.',
+		};
+	}
+
+	return {
+		exitCode: 0,
+		output: `Daemon started (pid ${lock.pid}, socket ${lock.socketPath}). CI trust level: ${trustLevel} (${trustSource}).`,
+	};
+}
+
+async function stop(opts: DaemonCliOptions): Promise<DaemonCliResult> {
+	const live = await readLiveLockfile(opts.projectRoot);
+	if (!live) {
+		return {exitCode: 0, output: 'No daemon is running.'};
+	}
+
+	// Prefer IPC: works on Windows (where SIGTERM is force-kill) and gives
+	// the daemon a chance to drain its event loop cleanly. Falls back to
+	// SIGTERM if IPC can't be reached (older daemon, socket missing, etc).
+	const ipcAccepted = await tryIpcShutdown(live.socketPath);
+
+	if (!ipcAccepted) {
+		try {
+			process.kill(live.pid, 'SIGTERM');
+		} catch (err) {
+			return {
+				exitCode: 1,
+				output: `Failed to stop daemon (pid ${live.pid}): IPC unreachable and SIGTERM failed: ${formatError(
+					err,
+				)}`,
+			};
+		}
+	}
+
+	// Allow the entry's 30s shutdown budget plus 5s for final cleanup.
+	// The lockfile still protects an active run from a second daemon.
+	const removed = await waitForLockfileGone(opts.projectRoot, 35_000);
+	if (!removed) {
+		const how = ipcAccepted ? 'IPC shutdown' : 'SIGTERM';
+		return {
+			exitCode: 1,
+			output: `Sent ${how} to daemon (pid ${live.pid}), but shutdown has not completed. Lockfile preserved; check the daemon log.`,
+		};
+	}
+	return {exitCode: 0, output: `Daemon stopped (was pid ${live.pid}).`};
+}
+
+/**
+ * Best-effort attempt to ask the daemon to shut itself down over IPC.
+ * Returns true if the daemon accepted the request. Any failure (no socket,
+ * timeout, older daemon without the method) returns false so the caller
+ * can fall back to SIGTERM.
+ */
+async function tryIpcShutdown(socketPath: string): Promise<boolean> {
+	const {DaemonIpcClient} = await import('./ipc');
+	const client = new DaemonIpcClient(socketPath);
+	try {
+		await Promise.race([
+			client.connect(),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error('IPC connect timeout')), 1000),
+			),
+		]);
+	} catch {
+		return false;
+	}
+	try {
+		await Promise.race([
+			client.shutdown(),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error('IPC shutdown timeout')), 2000),
+			),
+		]);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		await client.disconnect().catch(() => {});
+	}
+}
+
+async function status(opts: DaemonCliOptions): Promise<DaemonCliResult> {
+	const lock = await readLockfile(opts.projectRoot);
+	if (!lock) {
+		return {exitCode: 0, output: 'Not running.'};
+	}
+	const live = await readLiveLockfile(opts.projectRoot);
+	if (!live) {
+		return {
+			exitCode: 0,
+			output: `Stale lockfile cleaned (was pid ${lock.pid}). Daemon is not running.`,
+		};
+	}
+	const uptime = formatUptime(Date.now() - live.startedAt);
+	const trust = isTrustLevel(live.ciTrustLevel)
+		? `, CI trust level ${live.ciTrustLevel}`
+		: '';
+	return {
+		exitCode: 0,
+		output: `Running. pid ${live.pid}, socket ${live.socketPath}, uptime ${uptime}${trust}.`,
+	};
+}
+
+const LOG_TAIL_BYTES = 64 * 1024;
+// How far into the window we look for a line break before giving up on
+// realigning. Past this point the partial first line is worth more than the
+// alignment, since realigning would discard most of the tail. Ordinary log
+// lines are far shorter than this.
+const LOG_TAIL_REALIGN_BYTES = 4 * 1024;
+
+async function logs(opts: DaemonCliOptions): Promise<DaemonCliResult> {
+	const logPath = getLogPath(opts.projectRoot);
+	if (!existsSync(logPath)) {
+		return {exitCode: 0, output: 'No daemon log yet.'};
+	}
+	const size = statSync(logPath).size;
+	if (size === 0) {
+		return {exitCode: 0, output: ''};
+	}
+	const start = Math.max(0, size - LOG_TAIL_BYTES);
+	// Read the byte before the window as well. When it is a newline the window
+	// already opens on a whole line, and skipping past it keeps that line.
+	const readFrom = start === 0 ? 0 : start - 1;
+	const chunks: Buffer[] = [];
+	for await (const chunk of createReadStream(logPath, {
+		start: readFrom,
+		end: size - 1,
+	})) {
+		chunks.push(chunk as Buffer);
+	}
+	let tail = Buffer.concat(chunks);
+
+	if (start > 0) {
+		const newline = tail.indexOf(0x0a);
+		if (
+			newline !== -1 &&
+			newline < tail.length - 1 &&
+			newline <= LOG_TAIL_REALIGN_BYTES
+		) {
+			tail = tail.subarray(newline + 1);
+		} else {
+			// Either the window holds no usable line break, or the first one sits
+			// so far in that realigning to it would throw away most of the tail.
+			// Both cases keep the partial first line: drop the extra leading byte
+			// instead, plus the bytes of a character the window opened part way
+			// through.
+			let partial = 1;
+			while (
+				partial < tail.length &&
+				partial < 4 &&
+				(tail[partial] & 0xc0) === 0x80
+			) {
+				partial++;
+			}
+			tail = tail.subarray(partial);
+		}
+	}
+
+	return {exitCode: 0, output: tail.toString('utf-8')};
+}
+
+function launchSelfHosted(
+	projectRoot: string,
+	trustLevel: TrustLevel,
+): ChildProcess {
+	const daemonEntry = fileURLToPath(new URL('./entry.js', import.meta.url));
+	return defaultLaunchDaemon(projectRoot, daemonEntry, trustLevel);
+}
+
+async function waitForLockfile(
+	projectRoot: string,
+	timeoutMs: number,
+): Promise<{pid: number; socketPath: string} | null> {
+	const deadline = Date.now() + timeoutMs;
+	const path = getLockfilePath(projectRoot);
+	while (Date.now() < deadline) {
+		if (existsSync(path)) {
+			// Report the path the daemon actually bound, not a recomputed one:
+			// the socket location can depend on TMPDIR, which need not match
+			// between a launchd/systemd-started daemon and this process.
+			const live = await readLiveLockfile(projectRoot);
+			if (live) return {pid: live.pid, socketPath: live.socketPath};
+		}
+		await new Promise(r => setTimeout(r, 50));
+	}
+	return null;
+}
+
+async function waitForLockfileGone(
+	projectRoot: string,
+	timeoutMs: number,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		// Reap a stale lockfile only when its process has actually exited.
+		if (!(await readLiveLockfile(projectRoot))) return true;
+		await new Promise(r => setTimeout(r, 50));
+	}
+	return false;
+}
+
+function formatUptime(ms: number): string {
+	const seconds = Math.floor(ms / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h ${minutes % 60}m`;
+}

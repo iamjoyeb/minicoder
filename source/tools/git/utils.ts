@@ -1,0 +1,1023 @@
+/**
+ * Git Utilities
+ *
+ * Shared utilities for git operations including command execution,
+ * status parsing, and availability checks.
+ */
+
+import {spawn} from 'node:child_process';
+import {
+	accessSync,
+	constants,
+	existsSync,
+	readFileSync,
+	statSync,
+} from 'node:fs';
+import {delimiter, isAbsolute, join} from 'node:path';
+import {TIMEOUT_GH_METADATA_MS, TIMEOUT_GIT_PUSH_MS} from '@/constants';
+import {getProjectRoot} from '@/services/session-cwd';
+import {getLogger} from '@/utils/logging';
+
+const logger = getLogger();
+
+/**
+ * File change status from git
+ */
+export type FileChangeStatus =
+	| 'added'
+	| 'modified'
+	| 'deleted'
+	| 'renamed'
+	| 'copied';
+
+/**
+ * Represents a single file change
+ */
+export interface FileChange {
+	path: string;
+	status: FileChangeStatus;
+	oldPath?: string;
+	additions: number;
+	deletions: number;
+	isBinary: boolean;
+}
+
+/**
+ * Commit information
+ */
+export interface CommitInfo {
+	hash: string;
+	shortHash: string;
+	author: string;
+	email: string;
+	date: string;
+	relativeDate: string;
+	subject: string;
+	body: string;
+	filesChanged?: number;
+}
+
+// ============================================================================
+// Availability Checks (Synchronous - for conditional tool registration)
+//
+// These must never spawn child processes: they run while the tool registry
+// is built, and blocking on `git`/`gh` before the first rendered frame used
+// to cost ~200ms of startup (#1819). Availability is resolved by scanning
+// PATH / the .git directory on the filesystem instead.
+// ============================================================================
+
+/**
+ * Memoized PATH lookup per binary name. PATH is fixed for the life of a
+ * process, so each name costs one scan rather than one scan per call.
+ */
+const binaryOnPathCache = new Map<string, boolean>();
+
+/**
+ * Check whether an executable resolves on PATH without spawning a shell.
+ * Mirrors shell resolution: every PATH entry is checked against the bare
+ * name plus each PATHEXT extension on Windows (`.exe`, `.cmd`, ...).
+ * cmd.exe accepts quoted PATH entries (`"C:\Program Files\Git\cmd"`), so
+ * surrounding quotes are stripped before the directory is stat-ed — without
+ * that, git could be installed and working while this scan misses it.
+ */
+function isBinaryOnPath(name: string): boolean {
+	const cached = binaryOnPathCache.get(name);
+	if (cached !== undefined) return cached;
+
+	const pathEntries = (process.env.PATH ?? '')
+		.split(delimiter)
+		.map(entry => entry.replace(/^"(.*)"$/, '$1'))
+		.filter(Boolean);
+	const extensions =
+		process.platform === 'win32'
+			? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+					.split(';')
+					.filter(Boolean)
+			: [''];
+
+	let found = false;
+	for (const dir of pathEntries) {
+		for (const ext of extensions) {
+			const candidate = join(dir, name + ext);
+			try {
+				// Regular file only: a directory named like the binary must not
+				// count as an installed executable.
+				if (!statSync(candidate).isFile()) continue;
+				// X_OK mirrors whether a shell could actually exec the file: it
+				// checks the executable bit on Unix and is a no-op on Windows
+				// (where PATHEXT above does the equivalent filtering).
+				accessSync(candidate, constants.X_OK);
+				found = true;
+				break;
+			} catch {
+				// Missing, not a file, or not executable — keep looking.
+			}
+		}
+		if (found) break;
+	}
+
+	binaryOnPathCache.set(name, found);
+	return found;
+}
+
+/**
+ * @internal Test-only: clear the memoized PATH lookups so a test can point
+ * PATH at a fixture directory and get a fresh verdict instead of the
+ * cached one from the real environment.
+ */
+export function resetBinaryAvailabilityCacheForTests(): void {
+	binaryOnPathCache.clear();
+}
+
+/**
+ * Check if git is available on the system (synchronous, spawn-free)
+ */
+export function isGitAvailable(): boolean {
+	return isBinaryOnPath('git');
+}
+
+/**
+ * Check if the current directory is inside a git repository (synchronous,
+ * spawn-free). Walks up from `process.cwd()` looking for `.git`, the same
+ * filesystem signal the boot summary uses — also true inside worktrees,
+ * where `.git` is a `gitdir:` file rather than a directory.
+ *
+ * Unlike `git rev-parse --is-inside-work-tree`, this intentionally ignores
+ * the `GIT_DIR` / `GIT_WORK_TREE` environment variables: honoring them
+ * would mean shelling out again, which is exactly the cost this check
+ * exists to avoid. Advanced setups pointing GIT_DIR at an external repo
+ * will have the git tools hidden; execute_bash remains available.
+ */
+export function isInsideGitRepo(): boolean {
+	return findGitDirSync() !== null;
+}
+
+/**
+ * Check if gh CLI is available on the system (synchronous, spawn-free)
+ */
+export function isGhAvailable(): boolean {
+	return isBinaryOnPath('gh');
+}
+
+// ============================================================================
+// Synchronous Branch Helpers (safe to call from Ink <Static> render path)
+// ============================================================================
+
+/**
+ * Summary of git branch state used by the boot summary and /status panel.
+ */
+export interface GitStatusSummary {
+	branch: string;
+	isDefault: boolean;
+	detached: boolean;
+}
+
+/**
+ * Locate the .git directory for the current working directory by walking up
+ * the filesystem. Returns null when not inside a git repository. Synchronous.
+ *
+ * Also resolves the gitdir indirection used by git worktrees, where `.git`
+ * is a file containing `gitdir: <path>` rather than a directory.
+ */
+function findGitDirSync(startDir: string = process.cwd()): string | null {
+	let dir = startDir;
+	while (true) {
+		const candidate = join(dir, '.git');
+		if (existsSync(candidate)) {
+			try {
+				const stat = readFileSync(candidate, 'utf8');
+				const match = stat.match(/^gitdir:\s*(.+)\s*$/m);
+				if (match) {
+					const resolved = isAbsolute(match[1])
+						? match[1]
+						: join(dir, match[1]);
+					return resolved;
+				}
+			} catch {
+				// Not a file — assume it's the directory itself.
+			}
+			return candidate;
+		}
+		const parent = join(dir, '..');
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+
+/**
+ * Read the current branch name synchronously by parsing .git/HEAD.
+ * Returns null when not in a repo or HEAD can't be read.
+ * When HEAD is detached, returns a short SHA prefix.
+ *
+ * `startDir` is exposed for tests that want to point at a fixture directory
+ * without relying on `process.chdir` (which is racy with parallel tests and
+ * fails when `os.tmpdir()` happens to live inside the working tree).
+ */
+export function getCurrentBranchSync(
+	startDir: string = process.cwd(),
+): {branch: string; detached: boolean} | null {
+	const gitDir = findGitDirSync(startDir);
+	if (!gitDir) return null;
+	try {
+		const head = readFileSync(join(gitDir, 'HEAD'), 'utf8').trim();
+		const refMatch = head.match(/^ref:\s*refs\/heads\/(.+)$/);
+		if (refMatch) {
+			return {branch: refMatch[1], detached: false};
+		}
+		// Bare SHA = detached HEAD
+		return {branch: head.slice(0, 7), detached: true};
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Resolve the default branch synchronously. Prefers
+ * `.git/refs/remotes/origin/HEAD` (a symbolic ref) — checking both the loose
+ * file and `packed-refs`, since fresh clones often pack origin/HEAD. Falls
+ * back to whether `main` or `master` exists in `.git/refs/heads/` or
+ * `packed-refs`. Returns null when nothing can be resolved.
+ */
+export function getDefaultBranchSync(
+	startDir: string = process.cwd(),
+): string | null {
+	const gitDir = findGitDirSync(startDir);
+	if (!gitDir) return null;
+
+	try {
+		const originHead = join(gitDir, 'refs', 'remotes', 'origin', 'HEAD');
+		if (existsSync(originHead)) {
+			const contents = readFileSync(originHead, 'utf8').trim();
+			const match = contents.match(/^ref:\s*refs\/remotes\/origin\/(.+)$/);
+			if (match) return match[1];
+		}
+	} catch {
+		// fall through
+	}
+
+	let packedContents: string | null = null;
+	try {
+		const packed = join(gitDir, 'packed-refs');
+		if (existsSync(packed)) {
+			packedContents = readFileSync(packed, 'utf8');
+		}
+	} catch {
+		// ignore
+	}
+
+	// origin/HEAD is often packed (e.g. after a fresh clone).
+	if (packedContents) {
+		const packedOriginHead = packedContents.match(
+			/^#\s*ref:\s*refs\/remotes\/origin\/(.+)$/m,
+		);
+		if (packedOriginHead) return packedOriginHead[1];
+	}
+
+	const headsDir = join(gitDir, 'refs', 'heads');
+	for (const candidate of ['main', 'master']) {
+		if (existsSync(join(headsDir, candidate))) return candidate;
+	}
+
+	if (packedContents) {
+		for (const candidate of ['main', 'master']) {
+			if (packedContents.includes(` refs/heads/${candidate}`)) return candidate;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Resolve a {@link GitStatusSummary} synchronously by reading the `.git`
+ * filesystem directly — no child processes, safe to call from Ink's
+ * `<Static>` render path. Returns null when not in a git repository so
+ * callers can cleanly omit the surface.
+ *
+ * Skips the `isInsideGitRepo()` check entirely: `getCurrentBranchSync`
+ * already returns null whenever no `.git` directory is found, which is the
+ * same signal at zero cost.
+ */
+export function getGitStatusSummarySync(
+	startDir: string = process.cwd(),
+): GitStatusSummary | null {
+	const current = getCurrentBranchSync(startDir);
+	if (!current) return null;
+	const defaultBranch = getDefaultBranchSync(startDir);
+	return {
+		branch: current.branch,
+		detached: current.detached,
+		isDefault: !current.detached && current.branch === defaultBranch,
+	};
+}
+
+/**
+ * Format a {@link GitStatusSummary} as a short suffix-marker label.
+ * Shared by the boot summary and the `/status` panel so the two surfaces
+ * can't drift on wording.
+ */
+export function formatGitStatusSummary(status: GitStatusSummary): {
+	branch: string;
+	marker: string | null;
+} {
+	if (status.detached) return {branch: status.branch, marker: 'detached'};
+	if (status.isDefault) return {branch: status.branch, marker: 'default'};
+	return {branch: status.branch, marker: null};
+}
+
+// ============================================================================
+// Git Command Execution
+// ============================================================================
+
+const GIT_TIMEOUT_MS = 60_000;
+
+/**
+ * Terminal prompts are disabled so a credential request fails with an error
+ * instead of waiting on input nobody can provide (#1344).
+ */
+const GIT_ENV = {...process.env, GIT_TERMINAL_PROMPT: '0'};
+
+interface ExecOptions {
+	signal?: AbortSignal;
+	env?: Record<string, string>;
+}
+
+/**
+ * Spawn a command, collect stdout bytes, and resolve without decoding chunks.
+ * Rejects with stderr (or an exit-code message) on non-zero exit. `label` is
+ * the human-readable command name used in error messages (e.g. 'Git', 'gh').
+ *
+ * stdin is closed so nothing the child runs can block on it, and the whole
+ * call is bounded by a timeout as a backstop for prompts that bypass stdin
+ * (ssh passphrases and gpg pinentry read the tty directly).
+ *
+ * `timeoutMs` overrides the default bound for slower calls (e.g. push).
+ * `options.signal` cancels the command and `options.env` adds variables such
+ * as GIT_INDEX_FILE on top of the default Git environment.
+ */
+function execProcessRaw(
+	command: string,
+	args: string[],
+	label: string,
+	timeoutMs?: number,
+	{signal, env}: ExecOptions = {},
+): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		// The project root, not the live process cwd: inside an ACP session it is
+		// the session's own directory (see services/session-cwd).
+		const proc = spawn(command, args, {
+			cwd: getProjectRoot(),
+			stdio: ['ignore', 'pipe', 'pipe'],
+			env: env ? {...GIT_ENV, ...env} : GIT_ENV,
+			signal,
+		});
+		const stdout: Buffer[] = [];
+		const stderr: Buffer[] = [];
+		let settled = false;
+
+		// Settle here rather than on `close`: a helper the child spawned (ssh,
+		// gpg, credential manager) inherits the stderr pipe, and `close` does
+		// not fire until every holder of that pipe has exited.
+		const limitMs = timeoutMs && timeoutMs > 0 ? timeoutMs : GIT_TIMEOUT_MS;
+		const timer = setTimeout(() => {
+			proc.stdout.destroy();
+			proc.stderr.destroy();
+			proc.kill();
+			settle(() =>
+				reject(
+					new Error(`${label} command timed out after ${limitMs / 1000}s`),
+				),
+			);
+		}, limitMs);
+
+		const settle = (finish: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			finish();
+		};
+
+		proc.stdout.on('data', (data: Buffer) => stdout.push(data));
+
+		proc.stderr.on('data', (data: Buffer) => stderr.push(data));
+
+		proc.on('close', (code: number | null) => {
+			settle(() => {
+				if (code === 0) {
+					resolve(Buffer.concat(stdout));
+				} else {
+					const stderrText = Buffer.concat(stderr).toString();
+					const errorMessage =
+						stderrText.trim() ||
+						`${label} command failed with exit code ${code}`;
+					reject(new Error(errorMessage));
+				}
+			});
+		});
+
+		proc.on('error', error => {
+			settle(() => {
+				if (signal?.aborted) {
+					reject(new Error(`${label} command cancelled`));
+					return;
+				}
+				reject(new Error(`Failed to execute ${command}: ${error.message}`));
+			});
+		});
+	});
+}
+
+function execProcess(
+	command: string,
+	args: string[],
+	label: string,
+	timeoutMs?: number,
+	options?: ExecOptions,
+): Promise<string> {
+	return execProcessRaw(command, args, label, timeoutMs, options).then(output =>
+		output.toString().trimEnd(),
+	);
+}
+
+/**
+ * Execute a git command and return the output. Pass `timeoutMs` for slower
+ * calls (e.g. push) and `options` to cancel or add environment variables.
+ */
+export async function execGit(
+	args: string[],
+	timeoutMs?: number,
+	options?: ExecOptions,
+): Promise<string> {
+	return execProcess('git', args, 'Git', timeoutMs, options);
+}
+
+/** Execute git and preserve stdout bytes exactly for target file snapshots. */
+export async function execGitBuffer(
+	args: string[],
+	timeoutMs?: number,
+	options?: ExecOptions,
+): Promise<Buffer> {
+	return execProcessRaw('git', args, 'Git', timeoutMs, options);
+}
+
+/**
+ * Execute a gh CLI command and return the output. Pass `timeoutMs` for
+ * calls that can be slow/hang (e.g. fetching CI run logs).
+ */
+export async function execGh(
+	args: string[],
+	timeoutMs?: number,
+	options?: ExecOptions,
+): Promise<string> {
+	return execProcess('gh', args, 'gh', timeoutMs, options);
+}
+
+// ============================================================================
+// Repository State Checks
+// ============================================================================
+
+/**
+ * Check if there are staged changes
+ */
+export async function hasStagedChanges(): Promise<boolean> {
+	try {
+		const diff = await execGit(['diff', '--cached', '--name-only']);
+		return diff.trim().length > 0;
+	} catch (error) {
+		logger.debug('Failed to check for staged changes', {error});
+		return false;
+	}
+}
+
+/**
+ * Check if a rebase is in progress
+ */
+export async function isRebaseInProgress(): Promise<boolean> {
+	try {
+		await execGit(['rev-parse', '--git-path', 'rebase-merge']);
+		const result = await execGit([
+			'rev-parse',
+			'--verify',
+			'--quiet',
+			'REBASE_HEAD',
+		]);
+		return result !== '';
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Check if a merge is in progress
+ */
+export async function isMergeInProgress(): Promise<boolean> {
+	try {
+		await execGit(['rev-parse', '--verify', '--quiet', 'MERGE_HEAD']);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// ============================================================================
+// Branch Operations
+// ============================================================================
+
+/**
+ * Get the current branch name
+ */
+export async function getCurrentBranch(): Promise<string> {
+	try {
+		return await execGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+	} catch (error) {
+		logger.debug('Failed to get current branch', {error});
+		return 'HEAD'; // Detached HEAD state
+	}
+}
+
+/**
+ * Get the current commit SHA. Used to confirm the local working tree
+ * actually matches a PR's head commit — robust to detached-HEAD checkouts
+ * (common in CI) and to local branches named differently than the PR's
+ * head branch, unlike comparing branch names.
+ */
+export async function getCurrentCommitSha(): Promise<string> {
+	return execGit(['rev-parse', 'HEAD']);
+}
+
+/**
+ * Head/base branch names and the head commit SHA for a PR, resolved via
+ * `gh pr view`.
+ */
+export interface PrRefs {
+	headRefName: string;
+	baseRefName: string;
+	headRefOid: string;
+}
+
+/**
+ * Resolve a PR's head/base branch names and head commit SHA. Used to
+ * confirm the local working tree actually matches the PR being reviewed
+ * before scanning it. Bounded by TIMEOUT_GH_METADATA_MS since this backs a
+ * headless/unattended command (`nanocoder verify`) that must not hang
+ * indefinitely on a stalled `gh` call.
+ */
+export async function getPrRefs(pr: number): Promise<PrRefs> {
+	const output = await execGh(
+		[
+			'pr',
+			'view',
+			pr.toString(),
+			'--json',
+			'headRefName,baseRefName,headRefOid',
+		],
+		TIMEOUT_GH_METADATA_MS,
+	);
+	return JSON.parse(output) as PrRefs;
+}
+
+/**
+ * List the file paths changed by a PR, for scoping tools (e.g. semgrep) to
+ * just what the PR touches instead of the whole repo. Bounded by
+ * TIMEOUT_GH_METADATA_MS — see {@link getPrRefs}.
+ */
+export async function getPrChangedFiles(pr: number): Promise<string[]> {
+	const output = await execGh(
+		['pr', 'diff', pr.toString(), '--name-only'],
+		TIMEOUT_GH_METADATA_MS,
+	);
+	return output
+		.split('\n')
+		.map(line => line.trim())
+		.filter(Boolean);
+}
+
+/**
+ * Resolve the open PR number for a branch, if one exists. Used by the daemon
+ * to decide whether a CI-failure diagnosis should be posted as a PR comment
+ * (no PR yet — e.g. a branch pushed before opening one — just means there's
+ * nowhere to post it). Bounded by TIMEOUT_GH_METADATA_MS — see {@link getPrRefs}.
+ */
+export async function getPrNumberForBranch(
+	branch: string,
+): Promise<number | undefined> {
+	const output = await execGh(
+		['pr', 'list', '--head', branch, '--json', 'number', '--limit', '1'],
+		TIMEOUT_GH_METADATA_MS,
+	);
+	const results = JSON.parse(output) as Array<{number: number}>;
+	return results[0]?.number;
+}
+
+/**
+ * Post a comment-only review to a PR. Shared by `verify --pr`'s
+ * `--post-review` and the daemon's CI-investigation posting — both want the
+ * exact same `gh pr review --comment` call.
+ */
+export async function postPrComment(pr: number, body: string): Promise<void> {
+	await execGh(['pr', 'review', pr.toString(), '--comment', '--body', body]);
+}
+
+/**
+ * Push a branch to `origin`. Harness-only (not an agent-facing tool) —
+ * used by the daemon's auto-fix/full-commit flow to publish a fix that was
+ * committed inside an isolated clone (see `ci-fix-worktree.ts`). Pass `cwd`
+ * to run this against that clone rather than the current process's own
+ * directory — the clone has its own independent object database, so the
+ * new commits only exist there, not wherever this function happens to be
+ * called from. Bounded by TIMEOUT_GIT_PUSH_MS since this backs an
+ * unattended background caller that must not hang forever on a stalled
+ * network push.
+ */
+export async function pushBranch(
+	branch: string,
+	opts?: {setUpstream?: boolean; cwd?: string},
+): Promise<void> {
+	const args: string[] = [];
+	if (opts?.cwd) args.push('-C', opts.cwd);
+	args.push('push');
+	if (opts?.setUpstream) args.push('-u');
+	args.push('origin', branch);
+	await execGit(args, TIMEOUT_GIT_PUSH_MS);
+}
+
+/**
+ * Open a draft PR. Harness-only (not an agent-facing tool) — deliberately
+ * NOT a reuse of `git-pr.tsx`'s `create` action, which infers `head` from
+ * `getCurrentBranch()` (the *caller's* current branch). That's wrong here:
+ * the daemon's own cwd is `projectRoot`, not the worktree whose branch is
+ * the actual PR head, so `head` must be passed explicitly. Bounded by
+ * TIMEOUT_GH_METADATA_MS — see {@link getPrRefs}.
+ */
+export async function createDraftPr(opts: {
+	title: string;
+	body: string;
+	base: string;
+	head: string;
+}): Promise<string> {
+	const output = await execGh(
+		[
+			'pr',
+			'create',
+			'--title',
+			opts.title,
+			'--base',
+			opts.base,
+			'--head',
+			opts.head,
+			'--draft',
+			'--body',
+			opts.body,
+		],
+		TIMEOUT_GH_METADATA_MS,
+	);
+	return output.trim();
+}
+
+/**
+ * Get the default branch (main or master)
+ */
+export async function getDefaultBranch(): Promise<string> {
+	try {
+		const remoteBranch = await execGit([
+			'symbolic-ref',
+			'refs/remotes/origin/HEAD',
+			'--short',
+		]);
+		return remoteBranch.replace('origin/', '');
+	} catch (error) {
+		logger.debug(
+			'Failed to resolve origin/HEAD, falling back to branch name detection',
+			{error},
+		);
+		// Fall back to checking if main or master exists
+		try {
+			await execGit(['rev-parse', '--verify', 'main']);
+			return 'main';
+		} catch {
+			try {
+				await execGit(['rev-parse', '--verify', 'master']);
+				return 'master';
+			} catch {
+				return 'main';
+			}
+		}
+	}
+}
+
+/**
+ * Get the upstream branch for the current branch
+ */
+export async function getUpstreamBranch(): Promise<string | null> {
+	try {
+		return await execGit(['rev-parse', '--abbrev-ref', '@{upstream}']);
+	} catch (error) {
+		logger.debug('Failed to get upstream branch', {error});
+		return null;
+	}
+}
+
+/**
+ * Get ahead/behind counts relative to upstream
+ */
+export async function getAheadBehind(): Promise<{
+	ahead: number;
+	behind: number;
+}> {
+	try {
+		const upstream = await getUpstreamBranch();
+		if (!upstream) return {ahead: 0, behind: 0};
+
+		const result = await execGit([
+			'rev-list',
+			'--left-right',
+			'--count',
+			`${upstream}...HEAD`,
+		]);
+		const [behind, ahead] = result.split('\t').map(n => parseInt(n, 10) || 0);
+		return {ahead, behind};
+	} catch (error) {
+		logger.debug('Failed to get ahead/behind counts', {error});
+		return {ahead: 0, behind: 0};
+	}
+}
+
+// ============================================================================
+// Commit Operations
+// ============================================================================
+
+/**
+ * Check if the last commit has been pushed
+ */
+export async function isLastCommitPushed(): Promise<boolean> {
+	try {
+		const upstream = await getUpstreamBranch();
+		if (!upstream) return false;
+
+		const {ahead} = await getAheadBehind();
+		return ahead === 0;
+	} catch (error) {
+		logger.debug('Failed to check if last commit is pushed', {error});
+		return false;
+	}
+}
+
+/**
+ * Which commits to walk: a revision range (`main..HEAD`) or a single branch.
+ * Not both - git would read them as two separate revisions and log the union.
+ */
+type CommitSelection =
+	| {range?: string; branch?: never}
+	| {branch?: string; range?: never};
+
+/**
+ * Get commits with various filters
+ */
+export async function getCommits(
+	options: CommitSelection & {
+		count?: number;
+		file?: string;
+		author?: string;
+		since?: string;
+		grep?: string;
+	},
+): Promise<CommitInfo[]> {
+	try {
+		const args = ['log', '--format=%H|%h|%an|%ae|%ad|%ar|%s', '--date=short'];
+
+		if (options.count) args.push(`-n`, options.count.toString());
+		if (options.range) args.push(options.range);
+		if (options.branch) args.push(options.branch);
+		if (options.author) args.push(`--author=${options.author}`);
+		if (options.since) args.push(`--since=${options.since}`);
+		if (options.grep) args.push(`--grep=${options.grep}`);
+		// Always close the revisions with `--`: a branch that shares its name
+		// with a file or folder (a `docs` branch next to `docs/`) is otherwise
+		// rejected as ambiguous, which would surface here as "no commits".
+		args.push('--');
+		if (options.file) args.push(options.file);
+
+		const output = await execGit(args);
+		if (!output.trim()) return [];
+
+		return output.split('\n').map(line => {
+			const [hash, shortHash, author, email, date, relativeDate, subject] =
+				line.split('|');
+			return {
+				hash: hash || '',
+				shortHash: shortHash || '',
+				author: author || '',
+				email: email || '',
+				date: date || '',
+				relativeDate: relativeDate || '',
+				subject: subject || '',
+				body: '',
+			};
+		});
+	} catch (error) {
+		logger.debug('Failed to get commits', {error});
+		return [];
+	}
+}
+
+// ============================================================================
+// Status Parsing
+// ============================================================================
+
+/**
+ * Map git status character to FileChangeStatus
+ */
+function mapStatusChar(char: string): FileChangeStatus {
+	switch (char) {
+		case 'A':
+			return 'added';
+		case 'D':
+			return 'deleted';
+		case 'R':
+			return 'renamed';
+		case 'C':
+			return 'copied';
+		case 'M':
+		default:
+			return 'modified';
+	}
+}
+
+/**
+ * Parse git status --porcelain output
+ */
+export function parseGitStatus(statusOutput: string): {
+	staged: FileChange[];
+	unstaged: FileChange[];
+	untracked: string[];
+	conflicts: string[];
+} {
+	const staged: FileChange[] = [];
+	const unstaged: FileChange[] = [];
+	const untracked: string[] = [];
+	const conflicts: string[] = [];
+
+	const lines = statusOutput.split('\n').filter(line => line);
+
+	for (const line of lines) {
+		if (line.length < 3) continue;
+
+		const indexStatus = line[0];
+		const workTreeStatus = line[1];
+		const path = line.slice(3);
+
+		// Detect conflicts
+		if (
+			indexStatus === 'U' ||
+			workTreeStatus === 'U' ||
+			(indexStatus === 'A' && workTreeStatus === 'A') ||
+			(indexStatus === 'D' && workTreeStatus === 'D')
+		) {
+			conflicts.push(path);
+			continue;
+		}
+
+		// Untracked files
+		if (indexStatus === '?' && workTreeStatus === '?') {
+			untracked.push(path);
+			continue;
+		}
+
+		// Staged changes
+		if (indexStatus !== ' ' && indexStatus !== '?') {
+			staged.push({
+				path,
+				status: mapStatusChar(indexStatus),
+				additions: 0,
+				deletions: 0,
+				isBinary: false,
+			});
+		}
+
+		// Unstaged changes
+		if (workTreeStatus !== ' ' && workTreeStatus !== '?') {
+			unstaged.push({
+				path,
+				status: mapStatusChar(workTreeStatus),
+				additions: 0,
+				deletions: 0,
+				isBinary: false,
+			});
+		}
+	}
+
+	return {staged, unstaged, untracked, conflicts};
+}
+
+/**
+ * Get diff stats for files (additions/deletions)
+ */
+export async function getDiffStats(
+	staged: boolean = false,
+): Promise<Map<string, {additions: number; deletions: number}>> {
+	const stats = new Map<string, {additions: number; deletions: number}>();
+
+	try {
+		const args = ['diff', '--numstat'];
+		if (staged) args.push('--cached');
+
+		const output = await execGit(args);
+		if (!output.trim()) return stats;
+
+		for (const line of output.split('\n')) {
+			const parts = line.split('\t');
+			if (parts.length >= 3) {
+				const additions = parts[0] === '-' ? 0 : parseInt(parts[0], 10) || 0;
+				const deletions = parts[1] === '-' ? 0 : parseInt(parts[1], 10) || 0;
+				const path = parts[2];
+				stats.set(path, {additions, deletions});
+			}
+		}
+	} catch (error) {
+		logger.debug('Failed to get diff stats', {error});
+	}
+
+	return stats;
+}
+
+// ============================================================================
+// Stash Operations
+// ============================================================================
+
+/**
+ * Get stash count
+ */
+export async function getStashCount(): Promise<number> {
+	try {
+		const output = await execGit(['stash', 'list']);
+		if (!output.trim()) return 0;
+		return output.split('\n').length;
+	} catch (error) {
+		logger.debug('Failed to get stash count', {error});
+		return 0;
+	}
+}
+
+// ============================================================================
+// Diff Output Helpers
+// ============================================================================
+
+/**
+ * Truncate diff output if too long while preserving both ends of the diff.
+ * The beginning usually contains the file headers and the end often contains
+ * the final hunks, so keeping both gives the caller useful context without
+ * returning the entire result.
+ */
+export function truncateDiff(
+	diff: string,
+	maxLines: number = 500,
+): {
+	content: string;
+	truncated: boolean;
+	totalLines: number;
+} {
+	const lines = diff.split('\n');
+	const totalLines = lines.length;
+
+	if (totalLines <= maxLines) {
+		return {content: diff, truncated: false, totalLines};
+	}
+
+	const headLines = Math.ceil(maxLines / 2);
+	const tailLines = Math.floor(maxLines / 2);
+	const omittedLines = totalLines - headLines - tailLines;
+	const head = lines.slice(0, headLines).join('\n');
+	const tail = tailLines > 0 ? lines.slice(-tailLines).join('\n') : '';
+	const marker =
+		`... [Diff truncated: showing first ${headLines} and last ${tailLines} ` +
+		`of ${totalLines} lines; ${omittedLines} lines omitted]`;
+
+	return {
+		content: tail ? `${head}\n\n${marker}\n\n${tail}` : `${head}\n\n${marker}`,
+		truncated: true,
+		totalLines,
+	};
+}
+
+// ============================================================================
+// Formatting Helpers
+// ============================================================================
+
+/**
+ * Format file status character for display
+ */
+export function formatStatusChar(status: FileChangeStatus): string {
+	switch (status) {
+		case 'added':
+			return 'A';
+		case 'modified':
+			return 'M';
+		case 'deleted':
+			return 'D';
+		case 'renamed':
+			return 'R';
+		case 'copied':
+			return 'C';
+		default:
+			return '?';
+	}
+}

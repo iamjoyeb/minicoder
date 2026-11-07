@@ -1,0 +1,194 @@
+/**
+ * Environment-based configuration for Pino logger
+ */
+
+import nodeProcess from 'node:process';
+import {homedir, platform} from 'os';
+import {join} from 'path';
+import type {EnhancedLoggerConfig, LoggerConfig, LogLevel} from './types.js';
+
+/**
+ * Get the default log directory based on platform
+ * Follows OS conventions:
+ * - macOS: ~/Library/Logs/nanocoder
+ * - Linux: ~/.local/state/nanocoder/logs (XDG_STATE_HOME)
+ * - Windows: %LOCALAPPDATA%/nanocoder/logs
+ */
+export function getDefaultLogDirectory(): string {
+	if (nodeProcess.env.NANOCODER_LOG_DIR) {
+		return nodeProcess.env.NANOCODER_LOG_DIR;
+	}
+
+	switch (platform()) {
+		case 'win32':
+			return join(
+				nodeProcess.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'),
+				'nanocoder',
+				'logs',
+			);
+		case 'darwin':
+			return join(homedir(), 'Library', 'Logs', 'nanocoder');
+		default: // linux
+			return join(
+				nodeProcess.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'),
+				'nanocoder',
+				'logs',
+			);
+	}
+}
+
+/**
+ * Create development configuration (internal).
+ */
+function createDevelopmentConfig(): EnhancedLoggerConfig {
+	return {
+		level: (nodeProcess.env.NANOCODER_LOG_LEVEL as LogLevel) || 'debug',
+		pretty: true,
+		redact: ['apiKey', 'token', 'password', 'secret'],
+		correlation: true,
+		serialize: false,
+	};
+}
+
+/**
+ * Create production configuration (internal).
+ *
+ * In production, we want:
+ * - File logging enabled at 'info' level by default (for diagnostics)
+ * - Console/UI output silent by default
+ *
+ * The log level here controls what gets written to the log file.
+ * Console verbosity is governed separately, via getDefaultLogLevel() /
+ * getEnvironmentConfig() (NANOCODER_LOG_LEVEL opt-in) — not by this function.
+ * pino-logger.ts's createEnvironmentLogger() always writes through a
+ * file-only pino.destination() and never reads destination/target/options
+ * from this config, so those fields would be inert here.
+ */
+function createProductionConfig(): EnhancedLoggerConfig {
+	// Check if file logging is explicitly disabled
+	const disableFileLogging =
+		nodeProcess.env.NANOCODER_LOG_DISABLE_FILE === 'true';
+
+	// File log level defaults to 'info' for useful diagnostics
+	// Can be overridden with NANOCODER_LOG_LEVEL env var
+	const fileLogLevel: LogLevel = disableFileLogging
+		? 'silent'
+		: (nodeProcess.env.NANOCODER_LOG_LEVEL as LogLevel) || 'info';
+
+	return {
+		level: fileLogLevel,
+		pretty: false,
+		redact: ['apiKey', 'token', 'password', 'email', 'userId', 'secret'],
+		correlation: true,
+		serialize: true,
+	};
+}
+
+/**
+ * Create test configuration (internal).
+ */
+function createTestConfig(): EnhancedLoggerConfig {
+	return {
+		level: (nodeProcess.env.LOG_LEVEL as LogLevel) || 'debug', // Changed from 'silent' to 'debug'
+		pretty: false,
+		redact: ['apiKey', 'token', 'password'],
+		correlation: false,
+		serialize: false,
+		target: 'pino/file',
+		options: {
+			destination: '/dev/null',
+		},
+	};
+}
+
+/**
+ * Get configuration based on current environment (internal).
+ *
+ * For CLI tools, we default to production (silent) behavior when NODE_ENV is not set.
+ * This gives users a clean experience. Developers working on nanocoder itself should
+ * explicitly set NODE_ENV=development to see debug logs.
+ */
+function getEnvironmentConfig(): EnhancedLoggerConfig {
+	if (nodeProcess.env.NODE_ENV === 'test') {
+		return createTestConfig();
+	}
+
+	// Pretty/verbose console output is explicit opt-in via NANOCODER_LOG_LEVEL,
+	// not implicit based on NODE_ENV. This avoids polluting user output in production.
+	if (nodeProcess.env.NANOCODER_LOG_LEVEL) {
+		return createDevelopmentConfig();
+	}
+
+	return createProductionConfig();
+}
+
+/**
+ * Validate log level (internal).
+ */
+function validateLogLevel(level: string): boolean {
+	const validLevels = [
+		'fatal',
+		'error',
+		'warn',
+		'info',
+		'http',
+		'debug',
+		'trace',
+		'silent',
+	];
+	return validLevels.includes(level.toLowerCase());
+}
+
+/**
+ * Normalize log level string (internal).
+ */
+function normalizeLogLevel(level: string): string {
+	const normalized = level.toLowerCase().trim();
+
+	// Map common aliases
+	const aliases: Record<string, string> = {
+		warning: 'warn',
+		err: 'error',
+		information: 'info',
+		http: 'http',
+	};
+
+	return aliases[normalized] || normalized;
+}
+
+/**
+ * Create configuration with overrides
+ */
+export function createConfig(
+	overrides: Partial<LoggerConfig> = {},
+): EnhancedLoggerConfig {
+	const baseConfig = getEnvironmentConfig();
+
+	// Apply overrides with validation
+	if (overrides.level) {
+		const normalizedLevel = normalizeLogLevel(overrides.level);
+		if (!validateLogLevel(normalizedLevel)) {
+			console.warn(
+				`[WARNING] Invalid log level "${overrides.level}", using default`,
+			);
+		} else {
+			baseConfig.level = normalizedLevel as LogLevel;
+		}
+	}
+
+	if (overrides.redact) {
+		baseConfig.redact = [
+			...new Set([...baseConfig.redact, ...overrides.redact]),
+		];
+	}
+
+	// Merge other properties
+	return {
+		...baseConfig,
+		...overrides,
+		options: {
+			...baseConfig.options,
+			...(overrides as EnhancedLoggerConfig)?.options,
+		},
+	};
+}

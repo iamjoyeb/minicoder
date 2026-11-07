@@ -1,0 +1,1583 @@
+import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import test from 'ava';
+import {render} from 'ink-testing-library';
+import React from 'react';
+import {themes} from '../../config/themes.js';
+import {MAX_CACHEABLE_FILE_SIZE_BYTES} from '../../constants.js';
+import {resolveToolApproval} from '../approval-policy.js';
+import {ThemeContext} from '../../hooks/useTheme.js';
+import {
+	getProjectRoot,
+	resetSessionCwd,
+	setSessionCwd,
+} from '../../services/session-cwd.js';
+import {stringReplaceDisplayPath} from './string-replace-preview.js';
+import {stringReplaceTool} from './string-replace.js';
+import {clearReadTracker, markFileSeen} from '../../utils/read-tracker.js';
+import {
+	resetFirewallConfig,
+	setFirewallConfig,
+} from '../../firewall/mutation-firewall.js';
+import {readFileTool} from '../read-file.js';
+import {buildMinimalPdf} from '../../test-utils/minimal-pdf.js';
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping terminal styling before text-only assertions.
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const stripAnsi = (value: string) => value.replace(ANSI_RE, '');
+
+console.log(`\nstring-replace.spec.tsx – ${React.version}`);
+
+// Create a mock theme provider for tests
+function TestThemeProvider({children}: {children: React.ReactNode}) {
+	const themeContextValue = {
+		currentTheme: 'tokyo-night' as const,
+		colors: themes['tokyo-night'].colors,
+		setCurrentTheme: () => {},
+	};
+
+	return (
+		<ThemeContext.Provider value={themeContextValue}>
+			{children}
+		</ThemeContext.Provider>
+	);
+}
+
+let testDir: string;
+
+// Create a temporary directory before each test
+test.beforeEach(async () => {
+	testDir = await mkdtemp(join(tmpdir(), 'string-replace-test-'));
+	// Read-before-edit state is process-global; reset it between serial tests
+	// so a file "seen" by one test can't authorize an edit in another.
+	clearReadTracker();
+	resetFirewallConfig();
+});
+
+// Clean up temporary directory after each test
+test.afterEach(async () => {
+	if (testDir) {
+		await rm(testDir, {recursive: true, force: true});
+	}
+});
+
+// Helper to execute the string_replace tool
+async function executeStringReplace(args: {
+	path: string;
+	old_str: string;
+	new_str: string;
+}): Promise<string> {
+	// biome-ignore lint/suspicious/noExplicitAny: Tool internals require any
+	return await (stringReplaceTool.tool as any).execute(args, {
+		toolCallId: 'test',
+		messages: [],
+	});
+}
+
+// Helper to create a test file
+async function createTestFile(
+	filename: string,
+	content: string,
+): Promise<string> {
+	const filePath = join(testDir, filename);
+	await writeFile(filePath, content, 'utf-8');
+	return filePath;
+}
+
+// ============================================================================
+// Approval Tests
+// ============================================================================
+
+const replaceArgs = {path: 'test.txt', old_str: 'old', new_str: 'new'};
+
+test('string_replace requires approval in normal mode', async t => {
+	t.true(
+		await resolveToolApproval(
+			stringReplaceTool.name,
+			stringReplaceTool,
+			replaceArgs,
+			{mode: 'normal'},
+		),
+	);
+});
+
+test('string_replace does NOT require approval in auto-accept mode', async t => {
+	t.false(
+		await resolveToolApproval(
+			stringReplaceTool.name,
+			stringReplaceTool,
+			replaceArgs,
+			{mode: 'auto-accept'},
+		),
+	);
+});
+
+test('string_replace requires approval in plan mode', async t => {
+	t.true(
+		await resolveToolApproval(
+			stringReplaceTool.name,
+			stringReplaceTool,
+			replaceArgs,
+			{mode: 'plan'},
+		),
+	);
+});
+
+// ============================================================================
+// Basic Replacement Tests
+// ============================================================================
+
+test('string_replace: basic single-line replacement', async t => {
+	const filePath = await createTestFile(
+		'test.txt',
+		'Hello World\nGoodbye World\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'Hello World',
+		new_str: 'Hi Universe',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.is(newContent, 'Hi Universe\nGoodbye World\n');
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: multi-line replacement', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'function foo() {\n  return 1;\n}\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'function foo() {\n  return 1;\n}',
+		new_str: 'function foo() {\n  return 2;\n}',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.is(newContent, 'function foo() {\n  return 2;\n}\n');
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: insert content (add lines)', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		"import fs from 'fs';\n\nfunction main() {}\n",
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: "import fs from 'fs';\n\nfunction main() {}",
+		new_str: "import fs from 'fs';\nimport path from 'path';\n\nfunction main() {}",
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.true(newContent.includes("import path from 'path';"));
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: delete content (remove lines)', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'const x = 1;\nconst unused = 2;\nconst y = 3;\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'const x = 1;\nconst unused = 2;\nconst y = 3;',
+		new_str: 'const x = 1;\nconst y = 3;',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.false(newContent.includes('unused'));
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: replace with empty string (delete)', async t => {
+	const filePath = await createTestFile(
+		'test.txt',
+		'Keep this\nDelete this\nKeep this too\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'Delete this\n',
+		new_str: '',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.is(newContent, 'Keep this\nKeep this too\n');
+	t.true(result.includes('Successfully replaced'));
+});
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+test('string_replace: error when content not found', async t => {
+	const filePath = await createTestFile('test.txt', 'Hello World\n');
+
+	await t.throwsAsync(
+		async () => {
+			await executeStringReplace({
+				path: filePath,
+				old_str: 'This does not exist',
+				new_str: 'New content',
+			});
+		},
+		{
+			message: /Content not found in file/,
+		},
+	);
+});
+
+test('string_replace: error when multiple matches found', async t => {
+	const filePath = await createTestFile(
+		'test.txt',
+		'Hello World\nHello World\n',
+	);
+
+	await t.throwsAsync(
+		async () => {
+			await executeStringReplace({
+				path: filePath,
+				old_str: 'Hello World',
+				new_str: 'Hi Universe',
+			});
+		},
+		{
+			message: /Found 2 matches/,
+		},
+	);
+});
+
+test('string_replace: error when file does not exist', async t => {
+	await t.throwsAsync(
+		async () => {
+			await executeStringReplace({
+				path: join(testDir, 'nonexistent.txt'),
+				old_str: 'old',
+				new_str: 'new',
+			});
+		},
+		{
+			message: /ENOENT/,
+		},
+	);
+});
+
+test('string_replace: error when old_str is empty', async t => {
+	const filePath = await createTestFile('test.txt', 'content\n');
+
+	await t.throwsAsync(
+		async () => {
+			await executeStringReplace({
+				path: filePath,
+				old_str: '',
+				new_str: 'new',
+			});
+		},
+		{
+			message: /old_str cannot be empty/,
+		},
+	);
+});
+
+// ============================================================================
+// Context Matching Tests
+// ============================================================================
+
+test('string_replace: unique match with surrounding context', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'const a = 1;\nconst b = 2;\nconst c = 3;\n',
+	);
+
+	// Include context to make it unique
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'const a = 1;\nconst b = 2;',
+		new_str: 'const a = 1;\nconst b = 5;',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.is(newContent, 'const a = 1;\nconst b = 5;\nconst c = 3;\n');
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: whitespace must match exactly', async t => {
+	const filePath = await createTestFile('test.ts', 'function foo() {\n  return 1;\n}\n');
+
+	// This should fail because indentation doesn't match
+	await t.throwsAsync(
+		async () => {
+			await executeStringReplace({
+				path: filePath,
+				old_str: 'function foo() {\nreturn 1;\n}', // Missing indentation
+				new_str: 'function foo() {\n  return 2;\n}',
+			});
+		},
+		{
+			message: /Content not found/,
+		},
+	);
+});
+
+// ============================================================================
+// Large File Tests
+// ============================================================================
+
+test('string_replace: works with large replacements', async t => {
+	// Create a large block of text to replace
+	const largeOldBlock = Array.from({length: 60}, (_, i) => `line ${i + 1}`).join('\n');
+	const largeNewBlock = Array.from({length: 60}, (_, i) => `new line ${i + 1}`).join('\n');
+
+	const filePath = await createTestFile(
+		'test.txt',
+		`${largeOldBlock}\n`,
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: largeOldBlock,
+		new_str: largeNewBlock,
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.true(newContent.includes('new line 1'));
+	t.true(newContent.includes('new line 60'));
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: returns only a bounded context window around the edit', async t => {
+	const filePath = await createTestFile(
+		'large-context.txt',
+		Array.from({length: 100}, (_, i) => `line ${i + 1}`).join('\n'),
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'line 50',
+		new_str: 'changed line 50',
+	});
+
+	t.regex(result, /Updated file context \(lines 30-70 of 100\)/);
+	t.true(result.includes('[... lines 1-29 omitted ...]'));
+	t.true(result.includes('  30: line 30'));
+	t.true(result.includes('  50: changed line 50'));
+	t.true(result.includes('  70: line 70'));
+	t.true(result.includes('[... lines 71-100 omitted ...]'));
+	t.false(result.includes('  29: line 29'));
+	t.false(result.includes('  71: line 71'));
+});
+
+test('string_replace: clamps context windows at the file boundaries', async t => {
+	const filePath = await createTestFile(
+		'boundary-context.txt',
+		Array.from(
+			{length: 45},
+			(_, i) => `line ${String(i + 1).padStart(3, '0')}`,
+		).join('\n'),
+	);
+
+	const startResult = await executeStringReplace({
+		path: filePath,
+		old_str: 'line 001',
+		new_str: 'changed line 001',
+	});
+	const endResult = await executeStringReplace({
+		path: filePath,
+		old_str: 'line 045',
+		new_str: 'changed line 045',
+	});
+
+	t.regex(startResult, /Updated file context \(lines 1-21 of 45\)/);
+	t.false(startResult.includes('[... lines 1-'));
+	t.true(startResult.includes('[... lines 22-45 omitted ...]'));
+	t.regex(endResult, /Updated file context \(lines 25-45 of 45\)/);
+	t.true(endResult.includes('[... lines 1-24 omitted ...]'));
+	t.false(endResult.includes('[... lines 46-'));
+});
+
+test('string_replace: reports the line for inline matches', async t => {
+	const filePath = await createTestFile(
+		'inline-match.txt',
+		'prefix target suffix\nnext line\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'target',
+		new_str: 'replacement',
+	});
+
+	t.regex(result, /Successfully replaced content at line 1 \(now line 1\)/);
+});
+
+// ============================================================================
+// Validator Tests
+// ============================================================================
+
+test('string_replace validator: accepts valid input', async t => {
+	await createTestFile('test.txt', 'Hello World\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		markFileSeen('test.txt');
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'Hello',
+			new_str: 'Hi',
+		});
+
+		t.true(result.valid);
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace validator: rejects non-existent file', async t => {
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+
+		const result = await stringReplaceTool.validator({
+			path: 'nonexistent.txt',
+			old_str: 'old',
+			new_str: 'new',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.true(result.error.includes('does not exist'));
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace validator: rejects empty old_str', async t => {
+	await createTestFile('test.txt', 'content\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: '',
+			new_str: 'new',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.true(result.error.includes('cannot be empty'));
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace validator: rejects when content not found', async t => {
+	await createTestFile('test.txt', 'Hello World\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		markFileSeen('test.txt');
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'This does not exist',
+			new_str: 'new',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.true(result.error.includes('Content not found in file'));
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace validator: rejects when multiple matches found', async t => {
+	await createTestFile(
+		'test.txt',
+		'Hello World\nHello World\n',
+	);
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		markFileSeen('test.txt');
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'Hello World',
+			new_str: 'Hi Universe',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.true(result.error.includes('Found 2 matches'));
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace validator: rejects editing a file not read this session', async t => {
+	await createTestFile('test.txt', 'Hello World\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		// Note: no markFileSeen — the file has not been read this session.
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'Hello',
+			new_str: 'Hi',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.true(result.error.includes('must read'));
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace validator: allows editing after the file is read', async t => {
+	await createTestFile('test.txt', 'Hello World\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		// Simulate a prior read_file call against this file.
+		markFileSeen('test.txt');
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'Hello',
+			new_str: 'Hi',
+		});
+
+		t.true(result.valid);
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test.serial('string_replace validator: still allows edit after a stubbed re-read', async t => {
+	await createTestFile('test.txt', 'Hello World\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		await readFileTool.tool.execute!(
+			{path: 'test.txt'},
+			{toolCallId: 'test', messages: []},
+		);
+		const stub = await readFileTool.tool.execute!(
+			{path: 'test.txt'},
+			{toolCallId: 'test', messages: []},
+		);
+		t.true(String(stub).includes('already in context'));
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'Hello',
+			new_str: 'Hi',
+		});
+
+		t.true(result.valid);
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+// ============================================================================
+// Special Character Tests
+// ============================================================================
+
+test('string_replace: handles special regex characters', async t => {
+	const filePath = await createTestFile(
+		'test.txt',
+		'const regex = /test.*pattern/;\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'const regex = /test.*pattern/;',
+		new_str: 'const regex = /new.*pattern/;',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.is(newContent, 'const regex = /new.*pattern/;\n');
+	t.true(result.includes('Successfully replaced'));
+});
+
+test('string_replace: handles quotes and escapes', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'const str = "Hello \\"World\\"";\n',
+	);
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'const str = "Hello \\"World\\""',
+		new_str: 'const str = "Hi \\"Universe\\""',
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.true(newContent.includes('Hi \\"Universe\\"'));
+	t.true(result.includes('Successfully replaced'));
+});
+
+// ============================================================================
+// Formatter Tests
+// ============================================================================
+
+test('string_replace formatter: generates preview for valid replacement', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'const x = 1;\nconst y = 2;\nconst z = 3;\n',
+	);
+
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const preview = await stringReplaceTool.formatter({
+		path: filePath,
+		old_str: 'const x = 1;\nconst y = 2;',
+		new_str: 'const x = 1;\nconst y = 5;',
+	});
+
+	// Verify preview is a valid React element (truthy, has type property)
+	t.truthy(preview);
+	// React elements have a $$typeof property or type property
+	t.truthy(
+		preview && typeof preview === 'object' && ('$$typeof' in preview || 'type' in preview),
+	);
+});
+
+test('string_replace formatter: generates result message after execution', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'const x = 1;\nconst y = 2;\n',
+	);
+
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'const x = 1;',
+		new_str: 'const x = 10;',
+	});
+
+	const preview = await stringReplaceTool.formatter(
+		{
+			path: filePath,
+			old_str: 'const x = 1;',
+			new_str: 'const x = 10;',
+		},
+		result,
+	);
+
+	t.truthy(preview);
+	t.truthy(
+		preview && typeof preview === 'object' && ('$$typeof' in preview || 'type' in preview),
+	);
+});
+
+test('string_replace formatter: shows error for content not found', async t => {
+	const filePath = await createTestFile('test.txt', 'Hello World\n');
+
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const preview = await stringReplaceTool.formatter({
+		path: filePath,
+		old_str: 'This does not exist',
+		new_str: 'New content',
+	});
+
+	// Should return a React element with error content
+	t.truthy(preview);
+	t.truthy(
+		preview && typeof preview === 'object' && ('$$typeof' in preview || 'type' in preview),
+	);
+});
+
+test('string_replace formatter: shows error for multiple matches', async t => {
+	const filePath = await createTestFile(
+		'test.txt',
+		'Hello World\nHello World\n',
+	);
+
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const preview = await stringReplaceTool.formatter({
+		path: filePath,
+		old_str: 'Hello World',
+		new_str: 'Hi Universe',
+	});
+
+	t.truthy(preview);
+	t.truthy(
+		preview && typeof preview === 'object' && ('$$typeof' in preview || 'type' in preview),
+	);
+});
+
+test('string_replace formatter: handles file read errors gracefully', async t => {
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const preview = await stringReplaceTool.formatter({
+		path: join(testDir, 'nonexistent.txt'),
+		old_str: 'old',
+		new_str: 'new',
+	});
+
+	t.truthy(preview);
+	t.truthy(
+		preview && typeof preview === 'object' && ('$$typeof' in preview || 'type' in preview),
+	);
+});
+
+// ============================================================================
+// Validator Additional Error Handling Tests
+// ============================================================================
+
+test('string_replace validator: handles file read errors', async t => {
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	// Create a file but make it unreadable
+	const filePath = await createTestFile('test.txt', 'content\n');
+
+	// Mock getCachedFileContent to throw an error
+	const originalCache = await import('../../utils/file-cache.js');
+	const mockError = new Error('EACCES: permission denied');
+
+	// Since we can't easily mock the file cache, we'll test with an invalid path
+	// that causes the file read to fail in a different way
+	const result = await stringReplaceTool.validator({
+		path: join(testDir, 'nonexistent.txt'),
+		old_str: 'old',
+		new_str: 'new',
+	});
+
+	t.false(result.valid);
+	if (!result.valid) {
+		t.true(result.error.includes('does not exist') || result.error.includes('⚒'));
+	}
+});
+
+test('string_replace validator: handles file content access errors', async t => {
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	// Use a directory path instead of a file path to trigger a different error
+	const result = await stringReplaceTool.validator({
+		path: testDir, // Directory, not a file
+		old_str: 'old',
+		new_str: 'new',
+	});
+
+	// Should fail because it's a directory, not a file
+	t.false(result.valid);
+});
+
+// ============================================================================
+// Formatter Tests (Visual Display with Ink)
+// ============================================================================
+
+test('string_replace formatter: renders preview with basic replacement', async t => {
+	const filePath = await createTestFile(
+		'test.ts',
+		'const x = 1;\nconst y = 2;\nconst z = 3;\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'const y = 2;',
+		new_str: 'const y = 5;',
+	});
+	
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	t.regex(output!, /string_replace/);
+	t.regex(output!, /Path:/);
+	t.regex(output!, /Replacing 1 line/);
+});
+
+test('string_replace formatter: preview follows the session cwd', async t => {
+	const root = await mkdtemp(join(tmpdir(), 'string-replace-cwd-'));
+	const sub = join(root, 'sub');
+	await mkdir(sub);
+	await writeFile(join(root, 'note.txt'), 'launch text\n', 'utf-8');
+	await writeFile(join(sub, 'note.txt'), 'session text\n', 'utf-8');
+	setSessionCwd(sub);
+	try {
+		const formatter = stringReplaceTool.formatter;
+		if (!formatter) {
+			t.fail('Formatter not defined');
+			return;
+		}
+		const element = await formatter({
+			path: 'note.txt',
+			old_str: 'session text',
+			new_str: 'edited text',
+		});
+		const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+		const output = lastFrame() ?? '';
+		t.regex(output, /Replacing 1 line/);
+		t.false(/Content not found/.test(output));
+	} finally {
+		resetSessionCwd();
+		await rm(root, {recursive: true, force: true});
+	}
+});
+
+test('string_replace preview labels the file the session cwd resolves to', async t => {
+	// Inside the project: relative to the project root, so a `cd sub` edit of
+	// `note.txt` reads as `sub/note.txt`, not as the root's `note.txt`.
+	setSessionCwd(join(getProjectRoot(), 'source'));
+	try {
+		t.is(stringReplaceDisplayPath('note.txt'), join('source', 'note.txt'));
+	} finally {
+		resetSessionCwd();
+	}
+	// Outside the project: absolute.
+	const outside = await mkdtemp(join(tmpdir(), 'string-replace-outside-'));
+	setSessionCwd(outside);
+	try {
+		t.is(stringReplaceDisplayPath('note.txt'), join(outside, 'note.txt'));
+	} finally {
+		resetSessionCwd();
+		await rm(outside, {recursive: true, force: true});
+	}
+});
+
+test('string_replace formatter: says when the line cap hides edits', async t => {
+	const oldLines = Array.from({length: 25}, (_, i) => `old line ${i + 1}`);
+	const filePath = await createTestFile(
+		'long-replace.txt',
+		[...oldLines, 'tail 1', 'tail 2', 'tail 3'].join('\n'),
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: oldLines.join('\n'),
+		new_str: Array.from({length: 25}, (_, i) => `NEW_${i + 1}`).join('\n'),
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+
+	t.regex(lastFrame()!, /more lines, \d+ changed/);
+});
+
+test('string_replace formatter: shows normalized indentation for deeply indented code', async t => {
+	const filePath = await createTestFile(
+		'nested.tsx',
+		'      function Component() {\n        return (\n          <div>\n            <button>Click</button>\n          </div>\n        );\n      }\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: '            <button>Click</button>',
+		new_str: '            <button>Submit</button>',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	// Should show normalized indentation (not the original deep nesting)
+	// The leftmost code should start at column 0 after line numbers
+	t.regex(output!, /string_replace/);
+	t.regex(output!, /Path:/);
+});
+
+test('string_replace formatter: shows context before and after', async t => {
+	const filePath = await createTestFile(
+		'context.ts',
+		'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'line5',
+		new_str: 'CHANGED',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	// Should show context lines (3 before, 3 after)
+	t.regex(output!, /line2/);
+	t.regex(output!, /line3/);
+	t.regex(output!, /line4/);
+	t.regex(output!, /line6/);
+	t.regex(output!, /line7/);
+	t.regex(output!, /line8/);
+});
+
+test('string_replace formatter: displays error when content not found', async t => {
+	const filePath = await createTestFile('test.txt', 'Hello World\n');
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'Does not exist',
+		new_str: 'New',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	t.regex(output!, /Error.*Content not found/);
+});
+
+test('string_replace formatter: displays error when multiple matches', async t => {
+	const filePath = await createTestFile(
+		'duplicate.txt',
+		'foo\nfoo\nfoo\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'foo',
+		new_str: 'bar',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	t.regex(output!, /Error.*Found 3 matches/);
+	t.regex(output!, /Add more surrounding context/);
+});
+
+test('string_replace formatter: shows success after execution', async t => {
+	const filePath = await createTestFile('test.txt', 'old content\n');
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	// First execute the replacement
+	await executeStringReplace({
+		path: filePath,
+		old_str: 'old content',
+		new_str: 'new content',
+	});
+
+	// Then render the result state
+	const element = await formatter(
+		{
+			path: filePath,
+			old_str: 'old content',
+			new_str: 'new content',
+		},
+		'Successfully replaced content at line 1',
+	);
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	t.regex(output!, /string_replace/);
+	t.regex(output!, /Replace completed/);
+});
+
+test('string_replace formatter: handles multi-line replacements', async t => {
+	const filePath = await createTestFile(
+		'multi.ts',
+		'function old() {\n  return 1;\n}\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'function old() {\n  return 1;\n}',
+		new_str: 'function new() {\n  return 2;\n  return 3;\n}',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	t.regex(output!, /Replacing 3 lines with 4 lines/);
+});
+
+test('string_replace formatter: normalizes tabs to 2 spaces', async t => {
+	const filePath = await createTestFile(
+		'tabs.ts',
+		'\t\tfunction test() {\n\t\t\treturn 1;\n\t\t}\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: '\t\t\treturn 1;',
+		new_str: '\t\t\treturn 2;',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+
+	t.truthy(output);
+	// Should normalize tabs to spaces for display
+	t.regex(output!, /string_replace/);
+	t.regex(output!, /Path:/);
+});
+
+// ============================================================================
+// Literal Replacement Tests
+// ============================================================================
+
+// `$$`, `$&`, "$`" and `$'` are ordinary characters in shell scripts,
+// Makefiles and CI YAML, but they are substitution tokens to
+// String.prototype.replace. The replacement must land byte for byte.
+const DOLLAR_TOKENS = 'echo "pid=$$ match=$& pre=$` post=$\'"';
+
+test('string_replace: writes $ substitution tokens literally', async t => {
+	const filePath = await createTestFile(
+		'dollars.sh',
+		'#!/bin/sh\necho "old"\nexit 0\n',
+	);
+
+	await executeStringReplace({
+		path: filePath,
+		old_str: 'echo "old"',
+		new_str: DOLLAR_TOKENS,
+	});
+
+	t.is(
+		await readFile(filePath, 'utf-8'),
+		`#!/bin/sh\n${DOLLAR_TOKENS}\nexit 0\n`,
+	);
+});
+
+test('string_replace: $` and $\' do not splice the rest of the file in', async t => {
+	const filePath = await createTestFile(
+		'halves.txt',
+		'BEFORE\nTARGET\nAFTER\n',
+	);
+
+	await executeStringReplace({
+		path: filePath,
+		old_str: 'TARGET',
+		new_str: "$`$'",
+	});
+
+	const newContent = await readFile(filePath, 'utf-8');
+	t.is(newContent, "BEFORE\n$`$'\nAFTER\n");
+	t.false(newContent.includes('BEFORE\nBEFORE'));
+});
+
+test('string_replace: $ tokens in old_str still match and are removable', async t => {
+	const filePath = await createTestFile(
+		'makefile',
+		'all:\n\t@echo $$HOME $(shell pwd)\n',
+	);
+
+	await executeStringReplace({
+		path: filePath,
+		old_str: '@echo $$HOME $(shell pwd)',
+		new_str: '@echo $$PWD',
+	});
+
+	t.is(await readFile(filePath, 'utf-8'), 'all:\n\t@echo $$PWD\n');
+});
+
+// ============================================================================
+// Derived-content Guard Tests (PDF/DOCX)
+// ============================================================================
+
+test('string_replace: refuses a .pdf and leaves the document untouched', async t => {
+	const pdfBytes = '%PDF-1.4 fake document bytes';
+	const filePath = await createTestFile('doc.pdf', pdfBytes);
+
+	await t.throwsAsync(
+		executeStringReplace({
+			path: filePath,
+			old_str: 'wordCount',
+			new_str: 'pageCount',
+		}),
+		{message: /markdown transcript/},
+	);
+
+	t.is(await readFile(filePath, 'utf-8'), pdfBytes);
+});
+
+test('string_replace: the reported issue repro leaves the PDF intact', async t => {
+	// Verbatim reproduction from #1058: read the PDF, then replace a token that
+	// exists only in the transcript the read returned. Before the fix this
+	// reported success and left 50 bytes of markdown where the document was.
+	const filePath = join(testDir, 'doc.pdf');
+	const originalBytes = buildMinimalPdf('Hello World');
+	await writeFile(filePath, originalBytes);
+
+	// biome-ignore lint/suspicious/noExplicitAny: Tool internals require any
+	const transcript = (await (readFileTool.tool as any).execute(
+		{path: filePath},
+		{toolCallId: 'test', messages: []},
+	)) as string;
+
+	// The read really did hand back a transcript, so the premise holds.
+	t.regex(transcript, /wordCount/);
+	t.false(transcript.startsWith('%PDF-'));
+
+	await t.throwsAsync(
+		executeStringReplace({
+			path: filePath,
+			old_str: 'wordCount',
+			new_str: 'pageCount',
+		}),
+		{message: /markdown transcript/},
+	);
+
+	const afterBytes = await readFile(filePath);
+	t.deepEqual(afterBytes, originalBytes);
+	t.is(afterBytes.subarray(0, 5).toString('latin1'), '%PDF-');
+});
+
+test('string_replace validator: refuses a .docx path', async t => {
+	await createTestFile('spec.docx', 'PK fake docx bytes');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		markFileSeen('spec.docx');
+
+		const result = await stringReplaceTool.validator({
+			path: 'spec.docx',
+			old_str: 'fake',
+			new_str: 'real',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.regex(result.error, /markdown transcript/);
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+// ============================================================================
+// Encoding Guard Tests (#1854)
+// ============================================================================
+
+// "café" then "old", in Latin-1: the é is a lone E9 byte, not valid UTF-8.
+const LATIN1_BYTES = Buffer.from('caf\xe9\nold\n', 'latin1');
+
+test('string_replace: refuses a Latin-1 file and leaves every byte unchanged', async t => {
+	const filePath = join(testDir, 'legacy.txt');
+	await writeFile(filePath, LATIN1_BYTES);
+
+	await t.throwsAsync(
+		executeStringReplace({path: filePath, old_str: 'old', new_str: 'new'}),
+		{message: /not valid UTF-8/},
+	);
+
+	t.deepEqual(await readFile(filePath), LATIN1_BYTES);
+});
+
+test('string_replace: refuses a Latin-1 file too large for the file cache', async t => {
+	// Over the cache's single-file limit, so the read is never cached.
+	const bytes = Buffer.concat([
+		Buffer.alloc(MAX_CACHEABLE_FILE_SIZE_BYTES + 1024, 'x'),
+		Buffer.from('\n', 'latin1'),
+		LATIN1_BYTES,
+	]);
+	const filePath = join(testDir, 'large-legacy.txt');
+	await writeFile(filePath, bytes);
+
+	await t.throwsAsync(
+		executeStringReplace({path: filePath, old_str: 'old', new_str: 'new'}),
+		{message: /not valid UTF-8/},
+	);
+
+	// Buffer.equals, not deepEqual: AVA's deep diff is slow on megabytes.
+	t.true((await readFile(filePath)).equals(bytes), 'bytes unchanged');
+});
+
+test('string_replace: refuses Windows-1252 and Shift-JIS files too', async t => {
+	const files = {
+		// Windows-1252 curly quotes (93, 94) around "old".
+		'cp1252.txt': Buffer.from([0x93, 0x6f, 0x6c, 0x64, 0x94, 0x0a]),
+		// "日本" in Shift-JIS, then "old".
+		'sjis.txt': Buffer.from([0x93, 0xfa, 0x96, 0x7b, 0x0a, 0x6f, 0x6c, 0x64]),
+	};
+	for (const [name, bytes] of Object.entries(files)) {
+		const filePath = join(testDir, name);
+		await writeFile(filePath, bytes);
+
+		await t.throwsAsync(
+			executeStringReplace({path: filePath, old_str: 'old', new_str: 'new'}),
+			{message: /not valid UTF-8/},
+			name,
+		);
+		t.deepEqual(await readFile(filePath), bytes, name);
+	}
+});
+
+test('string_replace validator: refuses a Latin-1 file', async t => {
+	await writeFile(join(testDir, 'legacy.txt'), LATIN1_BYTES);
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		markFileSeen('legacy.txt');
+
+		const result = await stringReplaceTool.validator({
+			path: 'legacy.txt',
+			old_str: 'old',
+			new_str: 'new',
+		});
+
+		t.false(result.valid);
+		if (!result.valid) {
+			t.regex(result.error, /not valid UTF-8/);
+		}
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace: edits a UTF-8 file with non-ASCII text and keeps other lines byte for byte', async t => {
+	const filePath = await createTestFile('utf8.txt', 'café ✓ 日本\nold\n');
+
+	await executeStringReplace({path: filePath, old_str: 'old', new_str: 'new'});
+
+	t.deepEqual(
+		await readFile(filePath),
+		Buffer.from('café ✓ 日本\nnew\n', 'utf-8'),
+	);
+});
+
+test('string_replace: edits a UTF-8 file with a BOM and keeps the BOM', async t => {
+	const filePath = join(testDir, 'bom.txt');
+	await writeFile(filePath, Buffer.from('﻿old\n', 'utf-8'));
+
+	await executeStringReplace({path: filePath, old_str: 'old', new_str: 'new'});
+
+	t.deepEqual(
+		await readFile(filePath),
+		Buffer.from([0xef, 0xbb, 0xbf, 0x6e, 0x65, 0x77, 0x0a]),
+	);
+});
+
+test('string_replace: numbered group tokens stay literal', async t => {
+	const filePath = await createTestFile('groups.sh', 'run "old"\n');
+
+	await executeStringReplace({
+		path: filePath,
+		old_str: 'run "old"',
+		new_str: 'printf "%s\n" "$1" "$2" "$<" "$@"',
+	});
+
+	t.is(
+		await readFile(filePath, 'utf-8'),
+		'printf "%s\n" "$1" "$2" "$<" "$@"\n',
+	);
+});
+
+test('string_replace: formatter renders description when provided', async t => {
+	const filePath = await createTestFile(
+		'desc-test.txt',
+		'line one\nline two\nline three\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter is not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'line two',
+		new_str: 'line 2',
+		description: 'Replace two as 2 as user requests using digits for numbers.',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+	t.regex(output!, /Description:/);
+	t.regex(output!, /Replace two as 2 as user requests/);
+});
+
+test('string_replace: formatter does not render description when omitted', async t => {
+	const filePath = await createTestFile(
+		'desc-test-omitted.txt',
+		'line one\nline two\nline three\n',
+	);
+
+	const formatter = stringReplaceTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter is not defined');
+		return;
+	}
+
+	const element = await formatter({
+		path: filePath,
+		old_str: 'line two',
+		new_str: 'line 2',
+	});
+
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	const output = lastFrame();
+	t.truthy(output);
+	t.notRegex(output!, /Description:/);
+});
+
+
+// ============================================================================
+// CRLF files (#1930)
+// ============================================================================
+
+test('string_replace: multi-line LF edit matches a CRLF file', async t => {
+	const filePath = await createTestFile('a.txt', 'one\r\ntwo\r\nthree\r\n');
+
+	const result = await executeStringReplace({
+		path: filePath,
+		old_str: 'one\ntwo',
+		new_str: 'ONE\nTWO',
+	});
+
+	t.is(await readFile(filePath, 'utf-8'), 'ONE\r\nTWO\r\nthree\r\n');
+	t.true(result.includes('Successfully replaced content at lines 1-2'));
+});
+
+test('string_replace: added lines in a CRLF file keep CRLF', async t => {
+	const filePath = await createTestFile('b.txt', 'one\r\ntwo\r\nthree\r\n');
+
+	await executeStringReplace({
+		path: filePath,
+		old_str: 'two',
+		new_str: 'TWO\nTWO-b',
+	});
+
+	t.is(await readFile(filePath, 'utf-8'), 'one\r\nTWO\r\nTWO-b\r\nthree\r\n');
+});
+
+test('string_replace validator: accepts an LF edit for a CRLF file', async t => {
+	await createTestFile('test.txt', 'one\r\ntwo\r\nthree\r\n');
+
+	if (!stringReplaceTool.validator) {
+		t.fail('Validator not defined');
+		return;
+	}
+
+	const originalCwd = process.cwd();
+	try {
+		process.chdir(testDir);
+		markFileSeen('test.txt');
+
+		const result = await stringReplaceTool.validator({
+			path: 'test.txt',
+			old_str: 'one\ntwo',
+			new_str: 'ONE\nTWO',
+		});
+
+		t.true(result.valid);
+	} finally {
+		process.chdir(originalCwd);
+	}
+});
+
+test('string_replace formatter: previews an LF edit for a CRLF file', async t => {
+	const filePath = await createTestFile('test.ts', 'one\r\ntwo\r\nthree\r\n');
+
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+
+	const preview = await stringReplaceTool.formatter({
+		path: filePath,
+		old_str: 'one\ntwo',
+		new_str: 'ONE\nTWO',
+	});
+	const {lastFrame} = render(<TestThemeProvider>{preview}</TestThemeProvider>);
+
+	t.false(lastFrame()?.includes('Content not found') ?? true);
+	t.true(lastFrame()?.includes('ONE') ?? false);
+});
+
+test('string_replace formatter: result shows the edit line in a mixed-ending file', async t => {
+	const filePath = await createTestFile(
+		'mixed.txt',
+		'a\r\nb\r\nc\r\nd\r\nx\ny\n',
+	);
+	const args = {path: filePath, old_str: 'x\ny', new_str: 'X\nY'};
+
+	const result = await executeStringReplace(args);
+	t.is(await readFile(filePath, 'utf-8'), 'a\r\nb\r\nc\r\nd\r\nX\nY\n');
+
+	if (!stringReplaceTool.formatter) {
+		t.fail('Formatter not defined');
+		return;
+	}
+	const element = await stringReplaceTool.formatter(args, result);
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+	t.true(stripAnsi(lastFrame() ?? '').includes('Location: lines 5-6'));
+});
+
+test('string_replace: throws when mutation firewall blocks test deletion', async t => {
+	setFirewallConfig({mode: 'strict', enabled: true});
+	const filePath = await createTestFile(
+		'feature.spec.ts',
+		"test('feature A', () => {});\ntest('feature B', () => {});\n",
+	);
+	markFileSeen(filePath);
+
+	await t.throwsAsync(
+		async () => {
+			await executeStringReplace({
+				path: filePath,
+				old_str: "test('feature B', () => {});\n",
+				new_str: '',
+			});
+		},
+		{message: /\[Mutation Firewall\] Blocked mutation/},
+	);
+
+	const content = await readFile(filePath, 'utf-8');
+	t.true(content.includes('feature B'));
+});
+

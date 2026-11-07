@@ -1,0 +1,708 @@
+import {randomUUID} from 'node:crypto';
+import {getAppConfig} from '@/config/index';
+import {getBraveSearchApiKey} from '@/config/nanocoder-tools-config';
+import {buildToolEntry} from '@/custom-tools/build-tool';
+import {CustomToolLoader} from '@/custom-tools/loader';
+// Type-only import — the `MCPClient` runtime value is loaded dynamically
+// inside `initializeMCP()` so sessions without MCP servers never pay the
+// cost of the @modelcontextprotocol/sdk import graph.
+import type {MCPClient} from '@/mcp/mcp-client';
+import {MCPToolCatalog} from '@/mcp/tool-catalog';
+import {getAllToolExports} from '@/tools/index';
+import {createLoadToolSchemaTool} from '@/tools/mcp/load-tool-schema';
+import {getToolsForProfile, resolveToolProfile} from '@/tools/tool-profiles';
+import {ToolRegistry} from '@/tools/tool-registry';
+import type {TuneConfig} from '@/types/config';
+import type {CustomToolApprovalPolicy} from '@/types/custom-tools';
+import type {
+	AISDKCoreTool,
+	DevelopmentMode,
+	MCPInitResult,
+	MCPServer,
+	MCPTool,
+	StreamingFormatter,
+	ToolEntry,
+	ToolFormatter,
+	ToolHandler,
+	ToolValidator,
+} from '@/types/index';
+import type {MCPHealthChange} from '@/types/mcp';
+import {getLogger} from '@/utils/logging';
+import {logWarning} from '@/utils/message-queue';
+import {getShutdownManager} from '@/utils/shutdown';
+
+/**
+ * Filter knob for tool access methods. Default behavior hides scoped
+ * skill tools; pass `forSkill` to opt back in for tools owned by that
+ * skill (typically by its own subagent).
+ */
+export interface ToolVisibilityOptions {
+	forSkill?: string;
+}
+
+// Tools to exclude per development mode
+const MODE_EXCLUDED_TOOLS: Record<DevelopmentMode, string[]> = {
+	normal: ['write_plan'],
+	'auto-accept': ['write_plan'],
+	yolo: ['write_plan'],
+	plan: [
+		// No mutation tools — plan mode is read-only exploration
+		'write_file',
+		'string_replace',
+		'diff_edit',
+		'file_op',
+		'lsp_format_document',
+		'execute_bash',
+		'browser',
+		// No task tool — plan mode produces the plan itself
+		'write_tasks',
+		'write_walkthrough',
+		// No git mutation tools — keep read-only git tools
+		'git_add',
+		'git_commit',
+		// git_pr bundles both read-only actions (view/list/diff/checks/logs)
+		// and mutating ones (create/comment/review) behind one tool name, so
+		// it can't be split per-action here — excluded wholesale for now.
+		// source/verify/trust.ts is the action-granular allowlist meant to
+		// replace this blunt exclusion once the verify subcommand (issue
+		// #861) consumes it.
+		'git_pr',
+	],
+	headless: ['ask_user', 'agent', 'write_plan'],
+	architect: ['write_plan', 'git_commit', 'git_pr'],
+};
+
+export interface ModeFilterLookups {
+	getCustomToolPolicy(
+		name: string,
+	): {approval: CustomToolApprovalPolicy; readOnly: boolean} | undefined;
+	/** Server read-only annotation for an MCP tool; undefined when not MCP. */
+	getMcpReadOnly(name: string): boolean | undefined;
+}
+
+/**
+ * Apply a development mode's tool exclusions to a list of tool names.
+ *
+ * Custom tools follow the same posture as built-ins but with policy applied
+ * per-tool from their approval/readOnly metadata. MCP tools can't be
+ * enumerated in MODE_EXCLUDED_TOOLS (their names come from the server), so
+ * plan mode gates them on the server's read-only annotation instead - an
+ * unannotated tool may mutate, so it's hidden. The annotation is a
+ * server-supplied hint read off the MCP client, not the registry entry:
+ * isReadOnly() also decides checkpointing and parallel batching, which it
+ * must not influence.
+ */
+export function filterToolNamesForMode(
+	names: string[],
+	mode: DevelopmentMode,
+	lookups: ModeFilterLookups,
+): string[] {
+	const excludeSet = new Set(MODE_EXCLUDED_TOOLS[mode]);
+	let result = names.filter(n => !excludeSet.has(n));
+
+	if (mode === 'plan' || mode === 'headless') {
+		result = result.filter(n => {
+			const meta = lookups.getCustomToolPolicy(n);
+			if (!meta) {
+				return lookups.getMcpReadOnly(n) ?? true;
+			}
+			if (mode === 'headless') {
+				return meta.approval === 'never';
+			}
+			// plan mode: only read-only tools with no approval are safe
+			return meta.approval === 'never' && meta.readOnly;
+		});
+	}
+
+	return result;
+}
+
+/**
+ * Session-artifact tools. These write to the *parent session's* artifact
+ * directory, so a subagent calling one would silently overwrite the plan,
+ * task list, or walkthrough the user is about to act on. Subagents converse
+ * in text and report back through their return value; they have no business
+ * owning the session's lifecycle artifacts.
+ */
+export const SESSION_ARTIFACT_TOOLS = [
+	'write_plan',
+	'write_tasks',
+	'write_walkthrough',
+] as const;
+
+/**
+ * Manages built-in tools, MCP tools, and file-based custom tools.
+ * Single authority for tool availability, filtering, and approval policy.
+ */
+export class ToolManager {
+	private registry: ToolRegistry;
+	private mcpClient: MCPClient | null = null;
+	private mcpHealthUnsubscribe: (() => void) | null = null;
+	private customTools = new Map<
+		string,
+		{
+			approval: CustomToolApprovalPolicy;
+			readOnly: boolean;
+			source: 'personal' | 'project';
+			filePath: string;
+			subscribe?: import('@/types/skills').SkillTrigger[];
+		}
+	>();
+	private mcpCatalog: MCPToolCatalog = new MCPToolCatalog();
+
+	/** The manager this one is layered over; set only for a session's manager. */
+	private readonly parent?: ToolManager;
+	/** Shutdown handler name; one per manager, so closing one leaves the rest. */
+	private readonly mcpShutdownName: string;
+
+	constructor(parent?: ToolManager) {
+		this.parent = parent;
+		this.mcpShutdownName = parent ? `mcp-client:${randomUUID()}` : 'mcp-client';
+		this.mcpCatalog = new MCPToolCatalog(parent?.mcpCatalog);
+		if (parent) {
+			this.registry = new ToolRegistry(parent.registry);
+			this.customTools = parent.customTools;
+			return;
+		}
+		this.registry = ToolRegistry.fromToolExports(getAllToolExports());
+
+		// Remove web_search if no Brave Search API key is configured
+		if (!getBraveSearchApiKey()) {
+			this.registry.unregister('web_search');
+		}
+	}
+
+	/**
+	 * A manager for one ACP session: everything this one offers, read live,
+	 * plus MCP servers of its own that no other session sees. Connecting and
+	 * disconnecting it only ever touches those servers.
+	 */
+	forSession(): ToolManager {
+		return new ToolManager(this);
+	}
+
+	/**
+	 * Returns the MCP tool catalog for on-demand tool discovery.
+	 */
+	getMcpCatalog(): MCPToolCatalog {
+		return this.mcpCatalog;
+	}
+
+	/**
+	 * Dynamically loads an on-demand MCP tool from the catalog into the active ToolRegistry.
+	 */
+	loadMcpTool(toolName: string): boolean {
+		if (this.registry.hasTool(toolName)) {
+			this.mcpCatalog.markLoaded(toolName);
+			return true;
+		}
+
+		const mcpClient = this.mcpClient ?? this.parent?.mcpClient;
+		if (!mcpClient) return false;
+
+		const mcpToolEntries = mcpClient.getToolEntries();
+		const entry = mcpToolEntries.find(e => e.name === toolName);
+		if (!entry) return false;
+
+		this.registry.register(entry);
+		this.mcpCatalog.markLoaded(toolName);
+		return true;
+	}
+
+	/**
+	 * Initialize MCP servers and register their tools.
+	 *
+	 * Servers marked `"enabled": false` are skipped entirely — no connection,
+	 * no tools, no init result. That flag is the documented server-level gate
+	 * (see docs/configuration/mcp-configuration.md), and it is the only opt-out
+	 * for headless runs, where every MCP tool executes unattended. An absent
+	 * flag means enabled, so existing configs are unaffected.
+	 */
+	async initializeMCP(
+		servers: MCPServer[],
+		onProgress?: (result: MCPInitResult) => void,
+		onHealthChange?: (change: MCPHealthChange) => void,
+		tuneConfig?: Partial<TuneConfig>,
+	): Promise<MCPInitResult[]> {
+		const enabledServers = servers?.filter(server => server.enabled !== false);
+		// Reinitialization must close the previous transports before replacing the client.
+		await this.disconnectMCP();
+
+		if (enabledServers && enabledServers.length > 0) {
+			// Dynamic import — only paid for by sessions with configured MCP servers.
+			this.mcpClient = await this.createMCPClient();
+			const unsubscribeHealth = [
+				onHealthChange && this.mcpClient.onHealthChange(onHealthChange),
+				this.mcpClient.onHealthChange(change => {
+					if (change.status === 'unhealthy') {
+						const toolNames = Object.keys(
+							this.mcpClient?.getNativeToolsRegistry() || {},
+						).filter(
+							name =>
+								this.mcpClient?.getToolMapping().get(name)?.serverName ===
+								change.serverName,
+						);
+						this.registry.unregisterMany(toolNames);
+						this.mcpCatalog.removeServerTools(change.serverName);
+					} else if (change.status === 'connected') {
+						const entries =
+							this.mcpClient?.getToolEntries(change.serverName) || [];
+						this.registerMcpTools(entries);
+					}
+				}),
+			].filter((unsubscribe): unsubscribe is () => void => !!unsubscribe);
+			this.mcpHealthUnsubscribe = () => {
+				for (const unsubscribe of unsubscribeHealth) unsubscribe();
+			};
+
+			getShutdownManager().register({
+				name: this.mcpShutdownName,
+				priority: 20,
+				handler: async () => {
+					await this.disconnectMCP();
+				},
+			});
+
+			const results = await this.mcpClient.connectToServers(
+				enabledServers,
+				onProgress,
+			);
+
+			const mcpToolEntries = this.mcpClient.getToolEntries();
+			const mapping = this.mcpClient.getToolMapping();
+
+			const useDiscovery =
+				tuneConfig?.mcpDiscovery === 'always' ||
+				(tuneConfig?.mcpDiscovery !== 'disabled' && mcpToolEntries.length >= 8);
+
+			this.mcpCatalog.clear();
+			const discoveredTools: MCPTool[] =
+				typeof this.mcpClient.getAllDiscoveredTools === 'function'
+					? this.mcpClient.getAllDiscoveredTools()
+					: mcpToolEntries.map(e => {
+							const map = mapping.get(e.name);
+							return {
+								name: e.name,
+								serverName: map?.serverName || 'mcp',
+								readOnly: map?.readOnly,
+							};
+						});
+
+			for (const tool of discoveredTools) {
+				this.mcpCatalog.add(tool.serverName, tool, !useDiscovery);
+			}
+
+			if (useDiscovery) {
+				this.registry.registerToolExport(createLoadToolSchemaTool(this));
+			} else {
+				this.registry.unregister('load_tool_schema');
+				this.registerMcpTools(mcpToolEntries);
+			}
+
+			// Tools are keyed by name, so a name two servers share silently
+			// reaches only one of them. Say which.
+			const conflicts =
+				typeof this.mcpClient.getToolNameConflicts === 'function'
+					? this.mcpClient.getToolNameConflicts()
+					: [];
+			if (conflicts.length > 0) {
+				const lines = conflicts
+					.slice(0, 5)
+					.map(
+						c =>
+							`"${c.tool}" (${c.servers.join(', ')}; calls go to ${c.active})`,
+					);
+				const more =
+					conflicts.length > 5 ? ` and ${conflicts.length - 5} more` : '';
+				const message = `MCP servers expose the same tool names, so only one server handles each: ${lines.join('; ')}${more}.`;
+				// An ACP session's manager has no TUI to show a chat warning;
+				// log it there, as registerMcpTools does for its own collisions.
+				if (this.parent) getLogger().warn(message);
+				else logWarning(message);
+			}
+
+			return results;
+		}
+		return [];
+	}
+
+	/**
+	 * Register a server's tools. A session's manager never takes a name its
+	 * parent already offers: the existing tool wins and the new one is skipped.
+	 */
+	private registerMcpTools(entries: ToolEntry[]): void {
+		const free = entries.filter(entry => {
+			const taken = this.parent?.hasTool(entry.name);
+			if (taken) {
+				getLogger().warn(
+					`MCP tool "${entry.name}" skipped: a tool with that name already exists`,
+				);
+			}
+			return !taken;
+		});
+		this.registry.registerMany(free);
+	}
+
+	protected async createMCPClient(): Promise<MCPClient> {
+		// The parent's factory builds a new client; its own is not handed over.
+		// Going through it keeps one seam for swapping the client in tests.
+		if (this.parent) return this.parent.createMCPClient();
+		const {MCPClient} = await import('@/mcp/mcp-client');
+		return new MCPClient();
+	}
+
+	/**
+	 * Load file-based custom tools from `.nanocoder/tools/` (project) and
+	 * the personal tools directory. Project tools override personal ones.
+	 * Custom tools whose name collides with a built-in or already-registered
+	 * MCP tool are skipped with an error. Returns a per-tool load summary so
+	 * callers can surface counts/errors at startup.
+	 */
+	initializeCustomTools(projectRoot?: string): {
+		loaded: string[];
+		errors: Array<{file: string; error: string}>;
+	} {
+		const loader = new CustomToolLoader(projectRoot ?? process.cwd());
+		const {tools, errors} = loader.load();
+		const loaded: string[] = [];
+		const collisions: Array<{file: string; error: string}> = [];
+
+		for (const t of tools) {
+			if (this.registry.hasTool(t.metadata.name)) {
+				collisions.push({
+					file: t.filePath,
+					error: `Tool name "${t.metadata.name}" collides with a built-in or MCP tool — skipping.`,
+				});
+				continue;
+			}
+			const entry = buildToolEntry(t, loader.getProjectRoot());
+			this.registry.register(entry);
+			this.customTools.set(t.metadata.name, {
+				approval: t.metadata.approval,
+				readOnly: t.metadata.readOnly,
+				source: t.source,
+				filePath: t.filePath,
+				subscribe: t.subscribe,
+			});
+			loaded.push(t.metadata.name);
+		}
+
+		return {loaded, errors: [...errors, ...collisions]};
+	}
+
+	// =========================================================================
+	// Tool availability — single source of truth
+	// =========================================================================
+
+	/**
+	 * Get the list of tool names available given the current mode and tune config.
+	 * This is the single authority used by both prompt building and runtime.
+	 */
+	getAvailableToolNames(
+		tuneConfig?: TuneConfig,
+		developmentMode?: DevelopmentMode,
+		disabledTools?: readonly string[],
+		model?: string,
+	): string[] {
+		let names = this.getToolNames();
+
+		if (tuneConfig?.enabled) {
+			const profile = resolveToolProfile(tuneConfig.toolProfile, model);
+			if (profile !== 'full') {
+				const profileTools = getToolsForProfile(profile);
+				if (profileTools.length > 0) {
+					names = profileTools;
+				}
+			}
+		}
+
+		// The plan artifact is a mode capability, not a general-purpose tool.
+		// Keep it available even when a slim profile filters the normal tool set.
+		// Copy rather than push: `names` may still alias the shared, module-level
+		// profile array from getToolsForProfile(), and mutating that would leak
+		// write_plan into every later lookup of that profile for the life of the
+		// process.
+		if (
+			developmentMode === 'plan' &&
+			this.registry.hasTool('write_plan') &&
+			!names.includes('write_plan')
+		) {
+			names = [...names, 'write_plan'];
+		}
+
+		// Apply mode-based exclusions
+		if (developmentMode) {
+			names = this.filterToolNamesForMode(names, developmentMode);
+		}
+
+		// Apply user-configured disable list (intersects with profile + mode).
+		// Defaults to global app config; callers may pass an override (mainly
+		// for tests). This is global policy every caller should observe.
+		const disabled = disabledTools ?? getAppConfig().disabledTools;
+		if (disabled && disabled.length > 0) {
+			const disabledSet = new Set(disabled);
+			names = names.filter(n => !disabledSet.has(n));
+		}
+
+		return names;
+	}
+
+	/**
+	 * Drop the tools a development mode must not offer. Shared by the main
+	 * conversation (via getAvailableToolNames) and subagents, so a subagent
+	 * spawned in plan or headless mode can't reach tools its parent can't.
+	 */
+	filterToolNamesForMode(names: string[], mode: DevelopmentMode): string[] {
+		return filterToolNamesForMode(names, mode, {
+			getCustomToolPolicy: name => this.getCustomToolPolicy(name),
+			getMcpReadOnly: name =>
+				mode === 'plan' ? this.mcpReadOnly(name) : undefined,
+		});
+	}
+
+	private mcpReadOnly(name: string): boolean | undefined {
+		return (
+			this.mcpClient?.getToolMapping().get(name)?.readOnly ??
+			this.parent?.mcpReadOnly(name)
+		);
+	}
+
+	/**
+	 * Approval/read-only policy for a file-based custom tool, or for a
+	 * skill-bundle tool (registered straight into the registry, so its policy
+	 * is recovered from the entry's approval shape).
+	 */
+	private getCustomToolPolicy(
+		name: string,
+	): {approval: CustomToolApprovalPolicy; readOnly: boolean} | undefined {
+		const meta = this.customTools.get(name);
+		if (meta) return meta;
+		const entry = this.registry.getEntry(name);
+		if (!entry?.ownerSkill) return undefined;
+		const approval: CustomToolApprovalPolicy =
+			entry.approval === false || entry.approval === undefined
+				? 'never'
+				: entry.approval === true
+					? 'always'
+					: 'destructive';
+		return {approval, readOnly: entry.readOnly === true};
+	}
+
+	// =========================================================================
+	// Tool access — delegates to ToolRegistry
+	//
+	// All accessors return execute-stripped AI SDK tool definitions: the SDK
+	// never auto-executes, so the model only ever needs schemas/descriptions.
+	// Execution runs through the registry handler (see getToolHandler), which
+	// validates. Approval is decided separately by `resolveToolApproval`.
+	// =========================================================================
+
+	getAllTools(opts?: ToolVisibilityOptions): Record<string, AISDKCoreTool> {
+		return this.applyVisibility(this.registry.getNativeTools(), opts);
+	}
+
+	getFilteredTools(
+		allowedToolNames: string[],
+		opts?: ToolVisibilityOptions,
+	): Record<string, AISDKCoreTool> {
+		return this.filterByNames(this.getAllTools(opts), allowedToolNames);
+	}
+
+	/**
+	 * Drop scoped tools unless the caller opts in by passing the owning
+	 * skill's name. Tools without `scoped` set (built-ins, MCP, custom
+	 * tools, single-file skill tools) pass through untouched.
+	 */
+	private applyVisibility(
+		tools: Record<string, AISDKCoreTool>,
+		opts?: ToolVisibilityOptions,
+	): Record<string, AISDKCoreTool> {
+		const result: Record<string, AISDKCoreTool> = {};
+		for (const [name, tool] of Object.entries(tools)) {
+			const entry = this.registry.getEntry(name);
+			if (entry?.scoped) {
+				if (entry.ownerSkill && entry.ownerSkill === opts?.forSkill) {
+					result[name] = tool;
+				}
+				continue;
+			}
+			result[name] = tool;
+		}
+		return result;
+	}
+
+	private filterByNames(
+		tools: Record<string, AISDKCoreTool>,
+		allowedNames: string[],
+	): Record<string, AISDKCoreTool> {
+		const nameSet = new Set(allowedNames);
+		const filtered: Record<string, AISDKCoreTool> = {};
+		for (const [name, tool] of Object.entries(tools)) {
+			if (nameSet.has(name)) {
+				filtered[name] = tool;
+			}
+		}
+		return filtered;
+	}
+
+	getToolRegistry(): Record<string, ToolHandler> {
+		return this.registry.getHandlers();
+	}
+
+	getToolHandler(toolName: string): ToolHandler | undefined {
+		if (!this.registry.hasTool(toolName) && this.mcpCatalog.has(toolName)) {
+			this.loadMcpTool(toolName);
+		}
+		return this.registry.getHandler(toolName);
+	}
+
+	getToolFormatter(toolName: string): ToolFormatter | undefined {
+		if (!this.registry.hasTool(toolName) && this.mcpCatalog.has(toolName)) {
+			this.loadMcpTool(toolName);
+		}
+		return this.registry.getFormatter(toolName);
+	}
+
+	getToolValidator(toolName: string): ToolValidator | undefined {
+		if (!this.registry.hasTool(toolName) && this.mcpCatalog.has(toolName)) {
+			this.loadMcpTool(toolName);
+		}
+		return this.registry.getValidator(toolName);
+	}
+
+	getStreamingFormatter(toolName: string): StreamingFormatter | undefined {
+		return this.registry.getStreamingFormatter(toolName);
+	}
+
+	isReadOnly(toolName: string): boolean {
+		if (this.registry.hasTool(toolName)) {
+			return this.registry.getEntry(toolName)?.readOnly === true;
+		}
+		if (this.mcpCatalog.has(toolName)) {
+			return this.mcpCatalog.get(toolName)?.readOnly === true;
+		}
+		return false;
+	}
+
+	hasTool(toolName: string): boolean {
+		return this.registry.hasTool(toolName);
+	}
+
+	/**
+	 * Register a skill-provided tool. Wraps the registry call so the
+	 * registrar doesn't have to reach through `ToolManager` into
+	 * `ToolRegistry`. The entry's `ownerSkill` tag is preserved.
+	 */
+	registerSkillTool(entry: ToolEntry): void {
+		this.registry.register(entry);
+	}
+
+	/**
+	 * Unregister a previously-registered skill-provided tool. Returns true
+	 * if the tool was found and removed.
+	 */
+	unregisterSkillTool(toolName: string): boolean {
+		if (!this.registry.hasTool(toolName)) return false;
+		this.registry.unregister(toolName);
+		return true;
+	}
+
+	/**
+	 * Return the tool entry's `ownerSkill` tag, if any. Used by callers
+	 * (e.g. `/tools`, scoped-visibility filters) to attribute a tool back
+	 * to the skill that registered it.
+	 */
+	getOwnerSkill(toolName: string): string | undefined {
+		return this.registry.getEntry(toolName)?.ownerSkill;
+	}
+
+	isCustomTool(toolName: string): boolean {
+		return this.customTools.has(toolName);
+	}
+
+	getCustomToolInfo(toolName: string):
+		| {
+				approval: CustomToolApprovalPolicy;
+				readOnly: boolean;
+				source: 'personal' | 'project';
+				filePath: string;
+				subscribe?: import('@/types/skills').SkillTrigger[];
+		  }
+		| undefined {
+		return this.customTools.get(toolName);
+	}
+
+	getCustomToolNames(): string[] {
+		return Array.from(this.customTools.keys());
+	}
+
+	getMCPToolInfo(toolName: string): {isMCPTool: boolean; serverName?: string} {
+		const mapping = this.mcpClient?.getToolMapping().get(toolName);
+
+		if (mapping) {
+			return {
+				isMCPTool: true,
+				serverName: mapping.serverName,
+			};
+		}
+
+		return this.parent?.getMCPToolInfo(toolName) ?? {isMCPTool: false};
+	}
+
+	async disconnectMCP(): Promise<void> {
+		this.mcpHealthUnsubscribe?.();
+		this.mcpHealthUnsubscribe = null;
+		this.mcpCatalog.clear();
+		this.registry.unregister('load_tool_schema');
+		if (this.mcpClient) {
+			const mcpTools = this.mcpClient.getNativeToolsRegistry();
+			const mcpToolNames = Object.keys(mcpTools);
+
+			this.registry.unregisterMany(mcpToolNames);
+			await this.mcpClient.disconnect();
+
+			this.mcpClient = null;
+		}
+
+		getShutdownManager().unregister(this.mcpShutdownName);
+	}
+
+	getToolEntry(toolName: string): ToolEntry | undefined {
+		if (!this.registry.hasTool(toolName) && this.mcpCatalog.has(toolName)) {
+			this.loadMcpTool(toolName);
+		}
+		return this.registry.getEntry(toolName);
+	}
+
+	getToolNames(): string[] {
+		return this.registry.getToolNames();
+	}
+
+	getToolCount(): number {
+		return this.registry.getToolCount();
+	}
+
+	getConnectedServers(): string[] {
+		return this.mcpClient?.getConnectedServers() || [];
+	}
+
+	getServerNames(): string[] {
+		return this.mcpClient?.getServerNames() || [];
+	}
+
+	getServerTools(serverName: string): MCPTool[] {
+		return this.mcpClient?.getServerTools(serverName) || [];
+	}
+
+	getServerInfo(serverName: string) {
+		return this.mcpClient?.getServerInfo(serverName);
+	}
+
+	getMCPClient() {
+		return this.mcpClient;
+	}
+
+	onMCPHealthChange(listener: (change: MCPHealthChange) => void): () => void {
+		return this.mcpClient?.onHealthChange(listener) || (() => {});
+	}
+}

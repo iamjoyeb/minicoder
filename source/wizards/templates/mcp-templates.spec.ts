@@ -1,0 +1,1012 @@
+import test from 'ava';
+import {MCP_TEMPLATES, resolveMcpTemplateId} from './mcp-templates.js';
+import type {McpTemplate, McpTransportType} from './mcp-templates.js';
+
+test('filesystem template: single directory', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'filesystem');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		allowedDirs: '/home/user/projects',
+	});
+
+	t.deepEqual(config.args, [
+		'-y',
+		'@modelcontextprotocol/server-filesystem',
+		'/home/user/projects',
+	]);
+});
+
+test('filesystem template: multiple comma-separated directories', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'filesystem');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		allowedDirs: '/home/user/projects, /home/user/documents, /tmp',
+	});
+
+	t.deepEqual(config.args, [
+		'-y',
+		'@modelcontextprotocol/server-filesystem',
+		'/home/user/projects',
+		'/home/user/documents',
+		'/tmp',
+	]);
+});
+
+test('filesystem template: handles extra whitespace', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'filesystem');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		allowedDirs: '  /home/user/projects  ,  /home/user/documents  ,  /tmp  ',
+	});
+
+	t.deepEqual(config.args, [
+		'-y',
+		'@modelcontextprotocol/server-filesystem',
+		'/home/user/projects',
+		'/home/user/documents',
+		'/tmp',
+	]);
+});
+
+test('filesystem template: filters empty strings', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'filesystem');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		allowedDirs: '/home/user/projects,,/tmp,',
+	});
+
+	t.deepEqual(config.args, [
+		'-y',
+		'@modelcontextprotocol/server-filesystem',
+		'/home/user/projects',
+		'/tmp',
+	]);
+});
+
+test('github template: creates config with env', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'github');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		githubToken: 'ghp_test123',
+	});
+
+	t.is(config.name, 'github');
+	t.deepEqual(config.args, ['-y', '@modelcontextprotocol/server-github']);
+	t.deepEqual(config.env, {
+		GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_test123',
+	});
+});
+
+test('postgres template: creates config with connection string', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'postgres');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		connectionString: 'postgresql://user:pass@localhost:5432/db',
+	});
+
+	t.is(config.name, 'postgres');
+	t.deepEqual(config.args, ['-y', '@modelcontextprotocol/server-postgres']);
+	t.deepEqual(config.env, {
+		POSTGRES_CONNECTION_STRING: 'postgresql://user:pass@localhost:5432/db',
+	});
+});
+
+test('brave-search template: creates config with API key', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'brave-search');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		braveApiKey: 'test-api-key',
+	});
+
+	t.is(config.name, 'brave-search');
+	t.deepEqual(config.args, ['-y', '@modelcontextprotocol/server-brave-search']);
+	t.deepEqual(config.env, {
+		BRAVE_API_KEY: 'test-api-key',
+	});
+});
+
+test('fetch template: creates config without user-agent arg when default or empty', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fetch');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		userAgent: '',
+	});
+
+	t.is(config.name, 'fetch');
+	t.deepEqual(config.args, ['mcp-server-fetch']);
+	t.is(config.command, 'uvx');
+});
+
+test('fetch template: creates config with user-agent arg when custom user agent provided', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fetch');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		userAgent: 'CustomBot/1.0',
+	});
+
+	t.is(config.name, 'fetch');
+	t.deepEqual(config.args, ['mcp-server-fetch', '--user-agent=CustomBot/1.0']);
+	t.is(config.command, 'uvx');
+});
+
+test('custom template: single arg', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'node',
+		args: 'server.js',
+	});
+
+	t.is(config.name, 'my-server');
+	t.is(config.command, 'node');
+	t.deepEqual(config.args, ['server.js']);
+});
+
+test('custom template: multiple space-separated args', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'python',
+		args: '-m server --port 8000 --host localhost',
+	});
+
+	t.is(config.name, 'my-server');
+	t.is(config.command, 'python');
+	t.deepEqual(config.args, [
+		'-m',
+		'server',
+		'--port',
+		'8000',
+		'--host',
+		'localhost',
+	]);
+});
+
+test('custom template: handles extra whitespace in args', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'node',
+		args: '  server.js   --verbose  ',
+	});
+
+	t.deepEqual(config.args, ['server.js', '--verbose']);
+});
+
+test('custom template: filters empty strings in args', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'node',
+		args: 'server.js  --verbose',
+	});
+
+	t.deepEqual(config.args, ['server.js', '--verbose']);
+});
+
+test('custom template: no args', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: '/usr/local/bin/my-command',
+		args: '',
+	});
+
+	t.is(config.name, 'my-server');
+	t.is(config.command, '/usr/local/bin/my-command');
+	t.deepEqual(config.args, []);
+});
+
+test('custom template: with environment variables', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'node',
+		args: 'server.js',
+		envVars: 'PORT=8000\nHOST=localhost\nDEBUG=true',
+	});
+
+	t.deepEqual(config.env, {
+		PORT: '8000',
+		HOST: 'localhost',
+		DEBUG: 'true',
+	});
+});
+
+test('custom template: handles env vars with = in value', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'node',
+		args: 'server.js',
+		envVars: 'DB_URL=postgresql://user:pass=word@localhost:5432/db',
+	});
+
+	t.deepEqual(config.env, {
+		DB_URL: 'postgresql://user:pass=word@localhost:5432/db',
+	});
+});
+
+test('custom template: handles empty env var lines', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'custom');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'my-server',
+		command: 'node',
+		args: 'server.js',
+		envVars: 'PORT=8000\n\n\nHOST=localhost\n',
+	});
+
+	t.deepEqual(config.env, {
+		PORT: '8000',
+		HOST: 'localhost',
+	});
+});
+
+// ============================================================================
+// Tests for Remote Server Templates (New Feature)
+// ============================================================================
+
+test('deepwiki template: builds correct HTTP config', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'deepwiki');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'deepwiki');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://mcp.deepwiki.com/mcp');
+	t.is(config.timeout, 30000);
+	t.is(
+		config.description,
+		'DeepWiki provides up-to-date documentation you can talk to, for every repo in the world.',
+	);
+	t.deepEqual(config.tags, ['remote', 'wiki', 'documentation', 'http']);
+});
+
+test('context7 template: builds correct HTTP config', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'context7');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'context7');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://mcp.context7.com/mcp');
+	t.is(config.timeout, 30000);
+	t.is(
+		config.description,
+		'Up-to-date code documentation for LLMs and AI code editors.',
+	);
+	t.deepEqual(config.tags, ['remote', 'context', 'information', 'http']);
+});
+
+test('github-remote template: builds correct HTTP config with headers', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'github-remote');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		githubToken: 'ghp_test123',
+	});
+
+	t.is(config.name, 'github-remote');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://api.githubcopilot.com/mcp/');
+	t.is(config.timeout, 30000);
+	t.is(
+		config.description,
+		'Remote GitHub MCP server for repository management and operations',
+	);
+	t.deepEqual(config.tags, ['remote', 'github', 'git', 'repository', 'http']);
+	t.deepEqual(config.headers, {
+		Authorization: 'Bearer ghp_test123',
+	});
+});
+
+function answersFor(template: McpTemplate): Record<string, string> {
+	const answers: Record<string, string> = {};
+	for (const field of template.fields) {
+		answers[field.name] = field.sensitive
+			? 'secret'
+			: (field.default ?? 'placeholder');
+	}
+	return answers;
+}
+
+test('templates with a serverName field stamp templateId', t => {
+	for (const template of MCP_TEMPLATES) {
+		if (template.id === 'custom') continue;
+		if (!template.fields.some(field => field.name === 'serverName')) continue;
+
+		const answers = answersFor(template);
+		answers.serverName = `${template.id}-renamed`;
+		const built = template.buildConfig(answers);
+
+		t.is(built.name, `${template.id}-renamed`, template.id);
+		t.is(built.templateId, template.id, template.id);
+		t.is(resolveMcpTemplateId(built), template.id, template.id);
+	}
+});
+
+test('templates without a serverName field do not stamp templateId', t => {
+	for (const template of MCP_TEMPLATES) {
+		if (template.fields.some(field => field.name === 'serverName')) continue;
+
+		const built = template.buildConfig(answersFor(template));
+		t.is(built.templateId, undefined, template.id);
+	}
+});
+
+test('resolveMcpTemplateId: legacy github-remote without templateId keeps its template', t => {
+	t.is(
+		resolveMcpTemplateId({
+			name: 'gh-work',
+			transport: 'http',
+			url: 'https://api.githubcopilot.com/mcp/',
+			tags: ['remote', 'github', 'git', 'repository', 'http'],
+		}),
+		'github-remote',
+	);
+});
+
+test('you template: builds authenticated HTTP config with API key', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'you');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'you-paid',
+		apiKey: 'ydc_test_key_123',
+	});
+
+	t.is(config.name, 'you-paid');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://api.you.com/mcp');
+	t.is(config.timeout, 30000);
+	t.deepEqual(config.headers, {
+		Authorization: 'Bearer ydc_test_key_123',
+	});
+	t.deepEqual(config.tags, ['you', 'search', 'web', 'research', 'http']);
+});
+
+test('you template: defaults server name to you when unset', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'you');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'you');
+});
+
+test('you template: builds keyless free-profile config without API key', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'you');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'you');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://api.you.com/mcp?profile=free');
+	t.is(config.headers, undefined);
+});
+
+test('you template: trims whitespace from API key', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'you');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		apiKey: '  ydc_test_key_123  ',
+	});
+
+	t.is(config.url, 'https://api.you.com/mcp');
+	t.deepEqual(config.headers, {
+		Authorization: 'Bearer ydc_test_key_123',
+	});
+});
+
+test('you template: empty-string API key falls back to free profile', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'you');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		apiKey: '   ',
+	});
+
+	t.is(config.url, 'https://api.you.com/mcp?profile=free');
+	t.is(config.headers, undefined);
+});
+
+test('you template: stamps templateId so edits resolve under a custom name', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'you');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'you-paid',
+		apiKey: 'ydc_test_key_123',
+	});
+
+	t.is(config.templateId, 'you');
+	// The custom name no longer matches a template id, but resolution must
+	// still find `you` via the stamp rather than falling through to `custom`.
+	t.is(resolveMcpTemplateId(config), 'you');
+});
+
+test('serply template: builds HTTP config with X-API-Key header', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'serply');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'serply',
+		apiKey: 'serply_test_key_123',
+	});
+
+	t.is(config.name, 'serply');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://api.serply.io/mcp');
+	t.is(config.timeout, 30000);
+	t.deepEqual(config.headers, {'X-API-Key': 'serply_test_key_123'});
+	t.deepEqual(config.tags, ['serply', 'search', 'web', 'scrape', 'http']);
+});
+
+test('serply template: requires the API key field', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'serply');
+	t.truthy(template);
+
+	const apiKeyField = template!.fields.find(f => f.name === 'apiKey');
+	t.truthy(apiKeyField);
+	t.true(apiKeyField!.required);
+	t.true(apiKeyField!.sensitive);
+});
+
+test('serply template: defaults server name to serply when unset', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'serply');
+	t.truthy(template);
+
+	const config = template!.buildConfig({apiKey: 'serply_test_key_123'});
+
+	t.is(config.name, 'serply');
+});
+
+test('serply template: trims whitespace from API key', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'serply');
+	t.truthy(template);
+
+	const config = template!.buildConfig({apiKey: '  serply_test_key_123  '});
+
+	t.deepEqual(config.headers, {'X-API-Key': 'serply_test_key_123'});
+});
+
+test('serply template: stamps templateId so edits resolve under a custom name', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'serply');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'serply-work',
+		apiKey: 'serply_test_key_123',
+	});
+
+	t.is(config.templateId, 'serply');
+	t.is(resolveMcpTemplateId(config), 'serply');
+});
+
+test('fxmacrodata template: is listed as a remote HTTP template', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	t.truthy(template);
+
+	t.is(template!.name, 'FXMacroData');
+	t.is(template!.category, 'remote');
+	t.is(template!.transportType, 'http');
+});
+
+test('fxmacrodata template: builds keyless config without an auth header', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'fxmacrodata');
+	t.is(config.transport, 'http');
+	t.is(config.url, 'https://mcp.fxmacrodata.com');
+	t.is(config.timeout, 30000);
+	t.is(config.headers, undefined);
+	t.deepEqual(config.tags, [
+		'fxmacrodata',
+		'finance',
+		'macro',
+		'forex',
+		'http',
+	]);
+});
+
+test('fxmacrodata template: sends a bearer token when an API key is set', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'fxmacrodata',
+		apiKey: 'test-key',
+	});
+
+	t.is(config.url, 'https://mcp.fxmacrodata.com');
+	t.deepEqual(config.headers, {Authorization: 'Bearer test-key'});
+});
+
+test('fxmacrodata template: trims the API key and drops a blank one', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	t.truthy(template);
+
+	t.deepEqual(template!.buildConfig({apiKey: '  test-key  '}).headers, {
+		Authorization: 'Bearer test-key',
+	});
+	t.is(template!.buildConfig({apiKey: '   '}).headers, undefined);
+	t.is(template!.buildConfig({apiKey: ''}).headers, undefined);
+});
+
+test('fxmacrodata template: API key field is optional and sensitive', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	t.truthy(template);
+
+	const apiKeyField = template!.fields.find(f => f.name === 'apiKey');
+	t.truthy(apiKeyField);
+	t.false(apiKeyField!.required);
+	t.true(apiKeyField!.sensitive);
+});
+
+test('fxmacrodata template: validator rejects keys that are not a single header token', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	const validator = template!.fields.find(
+		f => f.name === 'apiKey',
+	)!.validator;
+	t.truthy(validator);
+
+	t.is(validator!('test-key'), undefined);
+	// Space, tab, LF, CR, NUL, DEL and a non-breaking space inside the key.
+	const badKeys = [0x20, 0x09, 0x0a, 0x0d, 0x00, 0x7f, 0xa0].map(
+		code => `test${String.fromCharCode(code)}key`,
+	);
+	for (const bad of badKeys) {
+		const error = validator!(bad);
+		t.truthy(error, JSON.stringify(bad));
+		t.false(error!.includes('test'), 'error must not echo the key');
+	}
+});
+
+test('fxmacrodata template: stamps templateId so edits resolve under a custom name', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'fxmacrodata');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		serverName: 'fxmacrodata-work',
+		apiKey: 'test-key',
+	});
+
+	t.is(config.name, 'fxmacrodata-work');
+	t.is(config.templateId, 'fxmacrodata');
+	t.is(resolveMcpTemplateId(config), 'fxmacrodata');
+});
+
+test('resolveMcpTemplateId: prefers templateId over tags and name', t => {
+	t.is(
+		resolveMcpTemplateId({
+			name: 'you-paid',
+			transport: 'http',
+			templateId: 'you',
+		}),
+		'you',
+	);
+});
+
+test('resolveMcpTemplateId: falls back to a matching tag for hand-edited configs', t => {
+	t.is(
+		resolveMcpTemplateId({name: 'you-paid', transport: 'http', tags: ['you']}),
+		'you',
+	);
+});
+
+test('resolveMcpTemplateId: tag fallback respects transport (github-remote)', t => {
+	// `github-remote` tags include `github`, but that template is stdio —
+	// an http server must not resolve to it.
+	t.is(
+		resolveMcpTemplateId({
+			name: 'gh-enterprise',
+			transport: 'http',
+			tags: ['remote', 'github'],
+		}),
+		undefined,
+	);
+	// The stdio counterpart is transport-compatible, but `github` hardcodes
+	// `name: 'github'` in buildConfig, so resolving to it would rename the
+	// server on save. It stays with the `custom` fallback instead.
+	t.is(
+		resolveMcpTemplateId({
+			name: 'gh-local',
+			transport: 'stdio',
+			tags: ['github'],
+		}),
+		undefined,
+	);
+});
+
+test('resolveMcpTemplateId: tag fallback skips templates that hardcode the name', t => {
+	// A hand-renamed filesystem server keeps its tags. Before the serverName
+	// guard this resolved to `filesystem`, whose buildConfig returns
+	// `name: 'filesystem'` — saving the edit silently renamed the server and
+	// replaced its args. `custom` round-trips name, command and args intact.
+	t.is(
+		resolveMcpTemplateId({
+			name: 'docs-fs',
+			transport: 'stdio',
+			tags: ['filesystem', 'local'],
+		}),
+		undefined,
+	);
+	// Zero-field templates are the same story via `simpleStdioTemplate`.
+	t.is(
+		resolveMcpTemplateId({
+			name: 'notes',
+			transport: 'stdio',
+			tags: ['memory', 'storage', 'stdio'],
+		}),
+		undefined,
+	);
+});
+
+test('resolveMcpTemplateId: never resolves a renamed server to a template that would rename it', t => {
+	// Property guard for the whole registry: whatever a template's tags are,
+	// a custom-named instance may only resolve to a template that can carry
+	// the custom name back through buildConfig.
+	const answersFor = (template: McpTemplate, customName: string) => {
+		const answers: Record<string, string> = {};
+		for (const field of template.fields) {
+			answers[field.name] = field.default ?? 'placeholder';
+		}
+		answers.serverName = customName;
+		return answers;
+	};
+
+	for (const template of MCP_TEMPLATES) {
+		if (template.id === 'custom') continue;
+
+		const customName = `${template.id}-renamed`;
+		const built = template.buildConfig(answersFor(template, customName));
+		const resolvedId = resolveMcpTemplateId({
+			name: customName,
+			transport: template.transportType,
+			tags: built.tags,
+		});
+		if (!resolvedId) continue;
+
+		const resolved = MCP_TEMPLATES.find(t => t.id === resolvedId);
+		if (!resolved) {
+			t.fail(`${template.id} resolved to unknown id ${resolvedId}`);
+			continue;
+		}
+		t.is(
+			resolved.buildConfig(answersFor(resolved, customName)).name,
+			customName,
+			`${template.id} resolves to ${resolvedId}, which would rename the server`,
+		);
+	}
+});
+
+test('resolveMcpTemplateId: falls back to the server name for default names', t => {
+	t.is(resolveMcpTemplateId({name: 'you', transport: 'http'}), 'you');
+});
+
+test('resolveMcpTemplateId: returns undefined for unmatched servers', t => {
+	t.is(resolveMcpTemplateId({name: 'my-custom-server', transport: 'http'}), undefined);
+	t.is(
+		resolveMcpTemplateId({name: 'x', transport: 'http', tags: ['not-a-template']}),
+		undefined,
+	);
+	// The generic `custom` tag must not resolve to the custom template —
+	// callers handle that fallback themselves and it carries no fields.
+	t.is(resolveMcpTemplateId({name: 'x', transport: 'http', tags: ['custom']}), undefined);
+});
+
+test('remote templates: have no required fields', t => {
+	const remoteTemplates = ['deepwiki', 'context7', 'github-remote'];
+
+	for (const templateId of remoteTemplates) {
+		const template = MCP_TEMPLATES.find(t => t.id === templateId);
+		t.truthy(template, `Remote template ${templateId} not found`);
+
+		// Remote templates should build successfully with empty answers
+		const config = template!.buildConfig({});
+		t.truthy(
+			config,
+			`Remote template ${templateId} should build with empty answers`,
+		);
+		t.is(typeof config.name, 'string');
+		t.is(typeof config.transport, 'string');
+	}
+});
+
+// ============================================================================
+// Dead-URL guard
+// ============================================================================
+
+// Hosts that used to operate public MCP endpoints but have since been retired.
+// Re-introducing any of these would silently hand users a broken config from
+// the wizard. Add to this list when a host disappears so the regression is
+// caught at unit-test time instead of in production.
+//
+// History:
+//   - remote.mcpservers.org: DNS-level dead as of ~2026-05-18; site pivoted
+//     from operator to directory.
+const KNOWN_DEAD_HOSTS = ['remote.mcpservers.org'];
+
+test('templates: no field default points at a known-dead host', t => {
+	for (const template of MCP_TEMPLATES) {
+		for (const field of template.fields) {
+			if (!field.default) continue;
+			for (const deadHost of KNOWN_DEAD_HOSTS) {
+				t.false(
+					field.default.includes(deadHost),
+					`Template ${template.id} field "${field.name}" default "${field.default}" hits known-dead host ${deadHost}`,
+				);
+			}
+		}
+	}
+});
+
+test('templates: no buildConfig output URL points at a known-dead host', t => {
+	for (const template of MCP_TEMPLATES) {
+		// Only remote transports produce URLs we care about. stdio templates
+		// don't build a URL, and several require user-supplied answers to
+		// buildConfig — skipping those here avoids needing a fixture map.
+		if (template.transportType !== 'http' && template.transportType !== 'websocket') {
+			continue;
+		}
+		const config = template.buildConfig({});
+		if (!config.url) continue;
+		for (const deadHost of KNOWN_DEAD_HOSTS) {
+			t.false(
+				config.url.includes(deadHost),
+				`Template ${template.id} URL "${config.url}" hits known-dead host ${deadHost}`,
+			);
+		}
+	}
+});
+
+// ============================================================================
+// Tests for Transport Field (New Feature)
+// ============================================================================
+
+test('all templates: include transport field', t => {
+	for (const template of MCP_TEMPLATES) {
+		// Generate minimal valid answers
+		const answers: Record<string, string> = {};
+		for (const field of template.fields) {
+			if (field.required) {
+				// For transport field, use a valid transport type
+				if (field.name === 'transport') {
+					answers[field.name] = 'stdio';
+				} else if (field.name === 'url' && answers.transport !== 'stdio') {
+					answers[field.name] = 'http://example.com'; // Provide URL for remote transports
+				} else {
+					answers[field.name] = 'test-value';
+				}
+			}
+		}
+
+		// For stdio transport, ensure command is provided even if not required
+		if (answers.transport === 'stdio') {
+			const commandField = template.fields.find(f => f.name === 'command');
+			if (commandField && !answers.command) {
+				answers.command = 'node'; // Default command for stdio
+			}
+		}
+
+		const config = template.buildConfig(answers);
+
+		t.truthy(
+			config.transport,
+			`Template ${template.id} missing transport field`,
+		);
+
+		// Test that transport is a valid type
+		const validTransports: McpTransportType[] = ['stdio', 'websocket', 'http'];
+		t.true(
+			validTransports.includes(config.transport),
+			`Template ${template.id} has invalid transport: ${config.transport}`,
+		);
+	}
+});
+
+test('local templates: use stdio transport', t => {
+	const localTemplates = [
+		'filesystem',
+		'github',
+		'postgres',
+		'brave-search',
+		'fetch',
+		'gitlab',
+		'playwright',
+		'chrome-devtools',
+		'duckduckgo',
+		'git',
+		'memory',
+	];
+
+	for (const templateId of localTemplates) {
+		const template = MCP_TEMPLATES.find(t => t.id === templateId);
+		t.truthy(template, `Template ${templateId} not found`);
+
+		const answers: Record<string, string> = {};
+		for (const field of template!.fields) {
+			if (field.required) {
+				if (field.name === 'repositoryPath') {
+					answers[field.name] = '/test/repo';
+				} else if (field.name === 'gitlabToken') {
+					answers[field.name] = 'test-token';
+				} else {
+					answers[field.name] = 'test-value';
+				}
+			}
+		}
+
+		const config = template!.buildConfig(answers);
+		t.is(
+			config.transport,
+			'stdio',
+			`Template ${templateId} should use stdio transport`,
+		);
+	}
+});
+
+test('remote templates: use http transport', t => {
+	const remoteTemplates = ['deepwiki', 'context7', 'github-remote', 'you'];
+
+	for (const templateId of remoteTemplates) {
+		const template = MCP_TEMPLATES.find(t => t.id === templateId);
+		t.truthy(template, `Remote template ${templateId} not found`);
+
+		const config = template!.buildConfig({});
+		t.is(
+			config.transport,
+			'http',
+			`Remote template ${templateId} should use http transport`,
+		);
+	}
+});
+
+// ============================================================================
+// Tests for New STDIO Server Templates
+// ============================================================================
+
+test('gitlab template: creates config with env', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'gitlab');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		gitlabToken: 'glpat-test123',
+		gitlabApiUrl: 'https://gitlab.example.com/api/v4',
+	});
+
+	t.is(config.name, 'gitlab');
+	t.deepEqual(config.args, ['-y', '@zereight/mcp-gitlab']);
+	t.deepEqual(config.env, {
+		GITLAB_PERSONAL_ACCESS_TOKEN: 'glpat-test123',
+		GITLAB_API_URL: 'https://gitlab.example.com/api/v4',
+	});
+});
+
+test('gitlab template: uses default API URL when not provided', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'gitlab');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		gitlabToken: 'glpat-test123',
+	});
+
+	t.is(config.name, 'gitlab');
+	t.deepEqual(config.args, ['-y', '@zereight/mcp-gitlab']);
+	t.deepEqual(config.env, {
+		GITLAB_PERSONAL_ACCESS_TOKEN: 'glpat-test123',
+		GITLAB_API_URL: 'https://gitlab.com/api/v4',
+	});
+});
+
+test('playwright template: creates config correctly', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'playwright');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'playwright');
+	t.deepEqual(config.args, ['@playwright/mcp@latest']);
+	t.is(config.env, undefined);
+});
+
+test('chrome-devtools template: creates config without headless mode', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'chrome-devtools');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		headless: 'false',
+	});
+
+	t.is(config.name, 'chrome-devtools');
+	t.deepEqual(config.args, ['-y', 'chrome-devtools-mcp@latest']);
+	t.is(config.env, undefined);
+});
+
+test('chrome-devtools template: creates config with headless mode', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'chrome-devtools');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		headless: 'true',
+	});
+
+	t.is(config.name, 'chrome-devtools');
+	t.deepEqual(config.args, [
+		'-y',
+		'chrome-devtools-mcp@latest',
+		'--headless=true',
+	]);
+	t.is(config.env, undefined);
+});
+
+test('duckduckgo template: creates config correctly', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'duckduckgo');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'duckduckgo');
+	t.deepEqual(config.args, ['duckduckgo-mcp-server']);
+	t.is(config.env, undefined);
+});
+
+test('git template: creates config with repository path', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'git');
+	t.truthy(template);
+
+	const config = template!.buildConfig({
+		repositoryPath: '/path/to/repo',
+	});
+
+	t.is(config.name, 'git');
+	t.deepEqual(config.args, ['mcp-server-git', '--repository', '/path/to/repo']);
+	t.is(config.env, undefined);
+});
+
+test('memory template: creates config correctly', t => {
+	const template = MCP_TEMPLATES.find(t => t.id === 'memory');
+	t.truthy(template);
+
+	const config = template!.buildConfig({});
+
+	t.is(config.name, 'memory');
+	t.deepEqual(config.args, ['-y', '@modelcontextprotocol/server-memory']);
+	t.is(config.env, undefined);
+});
+
+// ============================================================================
+// Tests for Transport Field (New Feature)
+// ============================================================================

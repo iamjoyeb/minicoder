@@ -1,0 +1,368 @@
+import {
+	type Tool as AISDKTool,
+	asSchema,
+	type JSONValue,
+	jsonSchema,
+	tool,
+} from 'ai';
+import React from 'react';
+import type {ToolManager} from '@/tools/tool-manager';
+import type {AIProviderConfig} from '@/types/config';
+import type {ResponseUsage} from '@/types/usage';
+
+export {asSchema, jsonSchema, tool};
+
+// Type for AI SDK tools (return type of tool() function)
+// Tool<PARAMETERS, RESULT> is AI SDK's actual tool type
+// We use 'any' for generics since we don't auto-execute tools (human-in-the-loop)
+// biome-ignore lint/suspicious/noExplicitAny: Dynamic typing required
+export type AISDKCoreTool = AISDKTool<any, any>;
+
+export type ToolApprovalPolicy =
+	| boolean
+	// biome-ignore lint/suspicious/noExplicitAny: tool args are schema-validated per tool
+	| ((args: any, mode: DevelopmentMode) => boolean | Promise<boolean>);
+
+export interface ImageAttachment {
+	data: string;
+	mediaType: string;
+	source?: string;
+}
+
+export interface Message {
+	role: 'user' | 'assistant' | 'system' | 'tool';
+	content: string;
+	tool_calls?: ToolCall[];
+	tool_call_id?: string;
+	name?: string;
+	reasoning?: string;
+	structuredContent?: JSONValue;
+	images?: ImageAttachment[];
+	durationMs?: number;
+	outcome?: 'completed' | 'cancelled' | 'failed';
+	/**
+	 * Harness-authored chrome: rendered in chat and persisted with session
+	 * history, but filtered out of the provider payload (see
+	 * `convertToModelMessages`) so the model is never handed nanocoder's own
+	 * UI text as its past output.
+	 *
+	 * Contract: never set this on a message carrying `tool_calls`. The payload
+	 * filter runs before orphan detection, so dropping such a message silently
+	 * drops the tool results that answer it.
+	 */
+	displayOnly?: boolean;
+	/**
+	 * Provider-reported usage for the completed ACP prompt that produced this
+	 * assistant message. Persisted so clients can restore the response footer
+	 * when a saved session is replayed. Older sessions omit this field.
+	 */
+	responseUsage?: ResponseUsage;
+}
+
+export interface ToolCall {
+	id: string;
+	function: {
+		name: string;
+		arguments: Record<string, unknown>;
+	};
+	/**
+	 * Set when the model's arguments were not a JSON object, such as text cut
+	 * off at the output-token limit. `arguments` is then `{}`, so the broken
+	 * text is never run or replayed. The call must not be run: it is answered
+	 * with this error so the model can retry.
+	 */
+	argumentsError?: string;
+}
+
+export interface ToolResult {
+	tool_call_id: string;
+	role: 'tool';
+	name: string;
+	content: string;
+	structuredContent?: JSONValue;
+	/** Raw base64. Sent as image parts, not copied into `content`. */
+	images?: ImageAttachment[];
+	isError?: boolean;
+}
+
+export interface ToolParameterSchema {
+	type?: string;
+	description?: string;
+	[key: string]: unknown;
+}
+
+export interface Tool {
+	type: 'function';
+	function: {
+		name: string;
+		description: string;
+		parameters: {
+			type: 'object';
+			properties: Record<string, ToolParameterSchema>;
+			required: string[];
+		};
+	};
+}
+
+export interface StructuredToolOutput {
+	llmContent: string;
+	structured?: JSONValue;
+	/**
+	 * Set by a handler whose run failed without throwing - a shell command that
+	 * exited non-zero, say - so the result carries the failure instead of every
+	 * caller re-deriving it from the text.
+	 */
+	isError?: boolean;
+}
+
+export interface VisualToolOutput {
+	llmContent: string;
+	images: ImageAttachment[];
+	/** Same failure flag as `StructuredToolOutput`. A throw still becomes `isError` in the catch path. */
+	isError?: boolean;
+}
+
+export type ToolExecuteResult =
+	| string
+	| StructuredToolOutput
+	| VisualToolOutput;
+
+export interface ToolExecutionContext {
+	abortSignal?: AbortSignal;
+	sessionId?: string;
+	workingDirectory?: string;
+	/**
+	 * The tools this call runs against, when they are not the process-wide set:
+	 * an ACP session with MCP servers of its own. A subagent it starts uses the
+	 * same ones.
+	 */
+	toolManager?: ToolManager;
+	/** The call being executed, so a subagent it starts can name its parent call. */
+	toolCallId?: string;
+	/** Set for a subagent's own tool calls: the run executing them. */
+	subagentRunId?: string;
+}
+
+export type ToolHandler = (
+	// biome-ignore lint/suspicious/noExplicitAny: Dynamic typing required -- Tool arguments are dynamically typed
+	input: any,
+	options?: ToolExecutionContext,
+) => Promise<ToolExecuteResult>;
+
+export type ToolFormatter = (
+	// biome-ignore lint/suspicious/noExplicitAny: Dynamic typing required -- Tool arguments are dynamically typed
+	args: any,
+	result?: string,
+) =>
+	| string
+	| Promise<string>
+	| React.ReactElement
+	| Promise<React.ReactElement>;
+
+export interface ValidationErrorDetail {
+	path?: string;
+	expected?: string;
+	received?: string;
+	message?: string;
+}
+
+export type ToolValidationResult =
+	| {valid: true}
+	| {valid: false; error: string; details?: ValidationErrorDetail[]};
+
+export type ToolValidator = (
+	// biome-ignore lint/suspicious/noExplicitAny: Dynamic typing required -- Tool arguments are dynamically typed
+	args: any,
+) => Promise<ToolValidationResult>;
+
+export type StreamingFormatter = (
+	// biome-ignore lint/suspicious/noExplicitAny: Dynamic typing required -- Tool arguments are dynamically typed
+	args: any,
+	executionId: string,
+) => React.ReactElement;
+
+export interface NanocoderToolExport {
+	name: string;
+	tool: AISDKCoreTool;
+	formatter?: ToolFormatter;
+	streamingFormatter?: StreamingFormatter;
+	validator?: ToolValidator;
+	readOnly?: boolean;
+	approval?: ToolApprovalPolicy;
+}
+
+export interface ToolEntry {
+	name: string;
+	tool: AISDKCoreTool;
+	handler: ToolHandler;
+	formatter?: ToolFormatter;
+	streamingFormatter?: StreamingFormatter;
+	validator?: ToolValidator;
+	readOnly?: boolean;
+	approval?: ToolApprovalPolicy;
+	ownerSkill?: string;
+	scoped?: boolean;
+}
+
+interface LLMMessage {
+	role: 'assistant';
+	content: string;
+	tool_calls?: ToolCall[];
+	reasoning?: string;
+}
+
+export interface ApiUsage {
+	inputTokens?: number;
+	outputTokens?: number;
+	totalTokens?: number;
+	/** Cached input tokens read from the provider cache. */
+	cacheReadTokens?: number;
+	/** Input tokens written to the provider cache. */
+	cacheWriteTokens?: number;
+}
+
+export interface ApiUsageSnapshot extends ApiUsage {
+	atMessageCount: number;
+}
+
+/**
+ * Per-call usage record accumulated across a session. Each entry corresponds
+ * to one API (model) invocation and carries the provider/model active at the
+ * time, so the /usage command can compute accurate per-provider costs from
+ * real provider-reported token counts rather than client-side estimates.
+ */
+export interface ApiCallRecord {
+	provider: string;
+	model: string;
+	inputTokens?: number;
+	outputTokens?: number;
+	totalTokens?: number;
+	cacheReadTokens?: number;
+	cacheWriteTokens?: number;
+	timestamp: number;
+}
+
+/**
+ * Provenance of a displayed context figure:
+ * - `api`: fully provider-reported (the snapshot covers the whole conversation,
+ *   or the estimated tail is too small to move the rounded percentage).
+ * - `api+estimate`: anchored on the provider-reported total, with a client-side
+ *   estimate added for the messages appended since the snapshot.
+ * - `estimate`: fully client-side (no usable API report yet).
+ */
+export type ContextSource = 'api' | 'api+estimate' | 'estimate';
+
+/**
+ * Why the provider stopped generating, as reported by the AI SDK.
+ *
+ * `length` is the load-bearing one: it means the response was cut off at the
+ * output-token limit, so what came back is a fragment rather than a finished
+ * turn. A fragment with no tool calls is indistinguishable from a model that
+ * simply finished talking unless the caller checks this, which is why it is
+ * carried out of the client rather than only logged.
+ */
+export type LLMFinishReason =
+	| 'stop'
+	| 'length'
+	| 'content-filter'
+	| 'tool-calls'
+	| 'error'
+	| 'other'
+	| 'unknown';
+
+export interface LLMChatResponse {
+	choices: Array<{
+		message: LLMMessage;
+	}>;
+	toolsDisabled?: boolean;
+	usage?: ApiUsage;
+	// Absent when the provider did not report one (e.g. the streamed-fallback
+	// path after a no-output error). Treat absence as "not truncated".
+	finishReason?: LLMFinishReason;
+}
+
+export interface StreamCallbacks {
+	onToken?: (token: string) => void;
+	onReasoningToken?: (token: string) => void;
+	onToolCall?: (toolCall: ToolCall) => void;
+	onFinish?: () => void;
+	onPrivacyEvent?: (scrubbedDelta: number) => void;
+}
+
+export interface ModeOverrides {
+	nonInteractiveMode: boolean;
+	nonInteractiveAlwaysAllow: string[];
+	modelParameters?: import('@/types/config').ModelParameters;
+	privacySessionMapRef?: import('react').MutableRefObject<
+		Record<string, string>
+	>;
+	privacyEnabled?: boolean;
+}
+
+export interface LLMClient {
+	getCurrentModel(): string;
+	setModel(model: string): void;
+	getContextSize(): number;
+	getAvailableModels(): Promise<string[]>;
+	getProviderConfig(): AIProviderConfig;
+	chat(
+		messages: Message[],
+		tools: Record<string, AISDKCoreTool>,
+		callbacks: StreamCallbacks,
+		signal?: AbortSignal,
+		modeOverrides?: ModeOverrides,
+	): Promise<LLMChatResponse>;
+	clearContext(): Promise<void>;
+	getTimeout(): number | undefined;
+}
+
+export type DevelopmentMode =
+	| 'normal'
+	| 'auto-accept'
+	| 'yolo'
+	| 'plan'
+	| 'architect'
+	| 'headless';
+
+export const DEVELOPMENT_MODE_LABELS: Record<DevelopmentMode, string> = {
+	normal: '▶ normal mode on',
+	'auto-accept': '⏵⏵ auto-accept mode on',
+	yolo: '⏵⏵⏵ yolo mode on',
+	plan: '⏸ plan mode on',
+	architect: '◈ architect mode on',
+	headless: '⏵⏵ headless mode on',
+};
+
+export const DEVELOPMENT_MODE_LABELS_NARROW: Record<DevelopmentMode, string> = {
+	normal: '▶ normal',
+	'auto-accept': '⏵⏵ auto',
+	yolo: '⏵⏵⏵ yolo',
+	plan: '⏸ plan',
+	architect: '◈ architect',
+	headless: '⏵⏵ headless',
+};
+
+export type ConnectionStatus = 'connected' | 'failed' | 'pending' | 'unhealthy';
+
+export interface MCPConnectionStatus {
+	name: string;
+	status: ConnectionStatus;
+	errorMessage?: string;
+}
+
+export interface LSPConnectionStatus {
+	name: string;
+	status: ConnectionStatus;
+	errorMessage?: string;
+}
+
+/** Status-bar summary of the live task list, shown while it is collapsed. */
+export interface TaskIndicatorInfo {
+	totalCount: number;
+	completedCount: number;
+	/** When > 0 the badge prefix '~' is shown (work in flight). */
+	inProgressCount: number;
+	isHidden: boolean;
+	/** The list changed while collapsed - badge renders in the warning colour. */
+	hasUnread: boolean;
+}
